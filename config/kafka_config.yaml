@@ -1,0 +1,11 @@
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  topic: "job_events"
+  producer_timeout_ms: 5000
+
+spark:
+  app_name: "CareerPulse"
+  master: "local[*]"
+  checkpoint_dir: "./data/checkpoints"
+  batch_duration_seconds: 10

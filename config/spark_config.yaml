@@ -1,0 +1,6 @@
+app_name: "CareerPulse"
+master: "local[*]"
+checkpoint_dir: "./data/checkpoints"
+batch_duration_seconds: 10
+streaming_topic: "job_events"
+job_history_table: "job_history"
