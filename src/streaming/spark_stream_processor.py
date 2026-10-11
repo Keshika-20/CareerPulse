@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -12,12 +11,22 @@ if str(ROOT) not in sys.path:
 
 try:
     from pyspark.sql import SparkSession
-    from pyspark.sql import functions as F
 except ImportError:  # pragma: no cover
     SparkSession = None
-    F = None
 
 from src.common.models import validate_record
+
+
+def aggregate_valid_event_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        ok, _ = validate_record(record)
+        if not ok:
+            continue
+        event_name = str(record.get("event", "")).upper()
+        if event_name:
+            counts[event_name] += 1
+    return dict(counts)
 
 
 class SparkJobStreamProcessor:
@@ -26,43 +35,72 @@ class SparkJobStreamProcessor:
         self.master = master
         self.spark = None
 
-        if SparkSession is not None:
-            self.spark = SparkSession.builder.appName(app_name).master(master).getOrCreate()
+        if SparkSession is None:
+            raise RuntimeError("Spark integration requires a compatible PySpark + Java environment. "
+                               "Ordinary Python validation and aggregation do not require a JVM.")
+
+        self.spark = SparkSession.builder.appName(app_name).master(master).getOrCreate()
 
     def process_batch(self, records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
         valid_records = []
         for record in records:
-            ok, error = validate_record(record)
+            ok, _ = validate_record(record)
             if not ok:
                 continue
-            valid_records.append(record)
+            event_name = str(record.get("event", "")).upper()
+            if event_name:
+                valid_records.append({**record, "event": event_name})
 
-        summary = Counter(record["event"].upper() for record in valid_records)
-        return dict(summary)
+        if not valid_records:
+            return {}
+
+        event_counts = (
+            self.spark.createDataFrame(valid_records)
+            .groupBy("event")
+            .count()
+            .collect()
+        )
+        return {row["event"]: int(row["count"]) for row in event_counts}
 
     def close(self) -> None:
         if self.spark is not None:
             self.spark.stop()
 
 
-def detect_change(previous_state: Optional[Dict[str, Any]], current_record: Dict[str, Any]) -> str:
+
+def detect_change(
+    previous_state: Optional[Dict[str, Any]],
+    current_record: Dict[str, Any],
+) -> str:
+    event_name = str(current_record.get("event", "")).upper()
+
+    # A closure event takes priority over changes to job fields.
+    if event_name == "CLOSED":
+        return "CLOSED"
+
+    # A job with no previous state is new.
     if previous_state is None:
         return "NEW"
-    if previous_state.get("company") != current_record.get("company"):
-        return "MODIFIED"
-    if current_record.get("event", "").upper() == "CLOSED":
-        return "CLOSED"
-    if previous_state.get("title") != current_record.get("title"):
-        return "MODIFIED"
+
+    # Compare fields that define the current job's details.
+    tracked_fields = (
+        "company",
+        "title",
+        "location",
+        "experience",
+        "salary",
+    )
+
+    for field in tracked_fields:
+        if previous_state.get(field) != current_record.get(field):
+            return "MODIFIED"
+
+    # The job details are unchanged; only metadata may differ.
     return "DUPLICATE"
 
 
 def summarize_event_stream(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
-    processor = SparkJobStreamProcessor()
-    try:
-        return processor.process_batch(records)
-    finally:
-        processor.close()
+    return aggregate_valid_event_counts(records)
 
 
 if __name__ == "__main__":

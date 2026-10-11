@@ -5,7 +5,7 @@ import json
 import random
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 COMPANIES = [
     "Google",
@@ -65,6 +65,67 @@ def generate_job_event(event_type: Optional[str] = None, job_id: Optional[str] =
 
 def generate_batch(count: int = 10, event_type: Optional[str] = None) -> List[Dict[str, Any]]:
     return [generate_job_event(event_type=event_type) for _ in range(count)]
+
+
+def generate_job_lifecycle(
+    event_types: Sequence[str],
+    job_id: Optional[str] = None,
+    seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if (
+        isinstance(event_types, str)
+        or not isinstance(event_types, Sequence)
+        or not event_types
+    ):
+        raise ValueError("event_types must be a non-empty sequence of lifecycle events.")
+
+    if any(not isinstance(event_type, str) for event_type in event_types):
+        raise ValueError("event_types must contain only event-type strings.")
+    normalized_events = [event_type.upper() for event_type in event_types]
+    if any(event_type not in EVENT_TYPES for event_type in normalized_events):
+        raise ValueError(f"event_types must contain only: {', '.join(EVENT_TYPES)}.")
+    if normalized_events[0] != "NEW":
+        raise ValueError("A job lifecycle must start with NEW.")
+    if "CLOSED" in normalized_events[:-1]:
+        raise ValueError("CLOSED must be the final lifecycle event.")
+    if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):
+        raise ValueError("job_id must be a non-empty string when provided.")
+
+    rng = random.Random(seed)
+    current_job_id = job_id or f"J{rng.randint(1000, 9999)}"
+    details = {
+        "company": rng.choice(COMPANIES),
+        "title": rng.choice(TITLES),
+        "location": rng.choice(LOCATIONS),
+        "experience": rng.choice(EXPERIENCE_LEVELS),
+        "salary": rng.randint(600000, 3000000),
+    }
+    events = []
+
+    for event_type in normalized_events:
+        if event_type == "MODIFIED":
+            field = rng.choice(tuple(details))
+            if field == "salary":
+                choices = [salary for salary in range(600000, 3000001, 10000) if salary != details[field]]
+                details[field] = rng.choice(choices)
+            else:
+                values = {
+                    "company": COMPANIES,
+                    "title": TITLES,
+                    "location": LOCATIONS,
+                    "experience": EXPERIENCE_LEVELS,
+                }
+                choices = [value for value in values[field] if value != details[field]]
+                details[field] = rng.choice(choices)
+
+        events.append({
+            "job_id": current_job_id,
+            **details,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event_type,
+        })
+
+    return events
 
 
 def write_events(events: Iterable[Dict[str, Any]], output_path: str) -> Path:
