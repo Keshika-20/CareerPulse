@@ -1,9 +1,21 @@
 # CareerPulse
 
-CareerPulse is a real-time Big Data project for tracking job-posting changes, hiring trend shifts, and demand signals using Kafka, PySpark, HBase, Parquet, Spark SQL/RDD, and a Streamlit dashboard.
+CareerPulse is a local job-market ingestion and lifecycle analytics project. It can fetch configured public Greenhouse and Lever company boards, normalize their postings, track changes across runs in SQLite, and display persisted or synthetic data in Streamlit.
+
+## Current Implementation Status
+
+- Greenhouse and Lever public company-board adapters are implemented. They use bounded HTTP timeouts and retries, and source responses are validated before a scan is treated as complete.
+- Listings are normalized to stable source/account/job IDs. Salary and experience may be unknown (`null`); provider salary ranges remain bounds and are not converted into an invented scalar salary.
+- SQLite is the durable snapshot and lifecycle store. An absent listing is closed only after two consecutive complete successful scans for its source account.
+- Spark is an explicit optional batch aggregation path (`--spark-batch`) over lifecycle events. It is not a streaming source or sink.
+- The dashboard labels synthetic demo data separately from persisted ingestion data.
+
+Kafka consumer integration, PySpark Structured Streaming, HBase persistence, ingestion-to-Parquet output, Spark SQL/RDD analytics, and machine-learning predictions are not implemented. The Kafka producer, in-memory HBase-shaped example, and Parquet helper are separate demonstrations and are not wired into the public-source ingestion path.
+
+The historical architecture sections below describe a target design, not the current runtime pipeline.
 
 ## 1. Project Goal
-The platform simulates realistic job-posting events and processes them in near real time to detect:
+The implemented workflow fetches public listings for configured company boards and tracks cross-run changes. A separate synthetic generator remains available for local demonstrations. The current ingestion workflow is batch-oriented, not real time. It can record:
 
 - new postings
 - modified postings
@@ -11,7 +23,7 @@ The platform simulates realistic job-posting events and processes them in near r
 - duplicate postings
 - hiring trend changes over time
 
-## 2. High-Level Architecture
+## 2. Target High-Level Architecture (Not Implemented)
 
 ```text
 Python Job Event Generator
@@ -132,7 +144,7 @@ Streamlit Dashboard
 - Top-k trending companies using Spark RDD
 - Predicted job demand/relevance using a simple ML model
 
-## 7. Technology Mapping
+## 7. Target Technology Mapping (Not Implemented)
 
 | Layer | Technology | Responsibility |
 |---|---|---|
@@ -211,4 +223,4 @@ CareerPulse/
 - Clear separation between ingestion, processing, storage, analytics, and UI
 
 ## 11. Summary
-CareerPulse is structured as a realistic medium-scale Big Data project that demonstrates end-to-end streaming analytics using a simplified but production-like pipeline. It balances operational storage, historical analytics, machine learning, and dashboard visualization while staying within a practical two-person implementation scope.
+This is a summary of the aspirational target design above, not a statement about current implementation. For the actual ingestion and runtime workflow, see [the ingestion guide](./docs/ingestion.md) and [the runbook](./docs/runbook.md).
