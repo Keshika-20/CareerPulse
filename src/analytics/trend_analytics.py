@@ -16,14 +16,24 @@ def aggregate_location_counts(records: Iterable[Dict[str, Any]]) -> List[Dict[st
 
 def average_salary_by_company(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[str, List[float]] = defaultdict(list)
+    companies = set()
     for record in records:
         company = str(record.get("company", "Unknown")).strip()
-        grouped[company].append(float(record.get("salary", 0)))
+        companies.add(company)
+        salary = record.get("salary")
+        if salary is not None:
+            grouped[company].append(float(salary))
 
     result = []
-    for company, salaries in sorted(grouped.items()):
-        average = sum(salaries) / len(salaries) if salaries else 0.0
-        result.append({"company": company, "average_salary": round(average, 2)})
+    for company in sorted(companies):
+        salaries = grouped[company]
+        average = sum(salaries) / len(salaries) if salaries else None
+        result.append(
+            {
+                "company": company,
+                "average_salary": round(average, 2) if average is not None else None,
+            }
+        )
     return result
 
 

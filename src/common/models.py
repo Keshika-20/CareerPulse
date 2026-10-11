@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 REQUIRED_FIELDS = {
     "job_id",
@@ -24,8 +25,8 @@ class JobEvent:
     company: str
     title: str
     location: str
-    experience: str
-    salary: float
+    experience: Optional[str]
+    salary: Optional[float]
     timestamp: str
     event: str
 
@@ -37,8 +38,12 @@ class JobEvent:
             company=str(clean["company"]).strip(),
             title=str(clean["title"]).strip(),
             location=str(clean["location"]).strip(),
-            experience=str(clean["experience"]).strip(),
-            salary=float(clean["salary"]),
+            experience=(
+                str(clean["experience"]).strip()
+                if clean["experience"] is not None
+                else None
+            ),
+            salary=float(clean["salary"]) if clean["salary"] is not None else None,
             timestamp=str(clean["timestamp"]),
             event=str(clean["event"]).upper(),
         )
@@ -76,16 +81,34 @@ def validate_record(record: Dict[str, Any]) -> Tuple[bool, str | None]:
     if not isinstance(record, dict):
         return False, "Record must be a dictionary."
 
-    missing = sorted(field for field in REQUIRED_FIELDS if field not in record or record[field] in (None, ""))
+    nullable_fields = {"experience", "salary"}
+    missing = sorted(
+        field
+        for field in REQUIRED_FIELDS
+        if field not in record
+        or record[field] == ""
+        or (record[field] is None and field not in nullable_fields)
+    )
     if missing:
         return False, f"Missing required fields: {', '.join(missing)}"
 
-    for field in ("job_id", "company", "title", "location", "experience", "event"):
+    for field in ("job_id", "company", "title", "location", "event"):
         if not isinstance(record[field], str):
             return False, f"Field '{field}' must be a string."
 
-    if not isinstance(record["salary"], (int, float)):
-        return False, "Field 'salary' must be numeric."
+    if record["experience"] is not None and not isinstance(record["experience"], str):
+        return False, "Field 'experience' must be a string or None."
+
+    salary = record["salary"]
+    if salary is not None:
+        if isinstance(salary, bool) or not isinstance(salary, (int, float)):
+            return False, "Field 'salary' must be a non-negative finite number or None."
+        try:
+            valid_salary = math.isfinite(salary) and salary >= 0
+        except OverflowError:
+            valid_salary = False
+        if not valid_salary:
+            return False, "Field 'salary' must be a non-negative finite number or None."
 
     if record["event"].upper() not in VALID_EVENTS:
         return False, "Event type must be one of NEW, MODIFIED, CLOSED, DUPLICATE."

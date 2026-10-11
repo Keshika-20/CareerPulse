@@ -1,335 +1,114 @@
 # CareerPulse Runbook
 
-This document explains exactly how to set up, run, and validate the CareerPulse project on a local machine.
+This runbook describes the implementation currently present in the repository. It does not describe Kafka-to-Spark streaming, HBase persistence, or a distributed deployment; those integrations are not implemented.
 
-Important:
-- This project has not been committed.
-- The instructions below are written for Windows PowerShell, which matches the current environment.
-- The project is implemented as a local Big Data pipeline scaffold. It includes code for event generation, Kafka-style publishing, Spark stream processing, storage adapters, analytics, and a Streamlit dashboard.
-
-## 1. Prerequisites
-
-Before running the project, make sure the following are installed on your machine:
+## Prerequisites
 
 - Python 3.10 or newer
-- pip (Python package installer)
-- Git (optional, for version control only)
-- Kafka broker (optional for real broker-based streaming)
-- Java JDK (recommended if you want true PySpark integration)
+- For optional Spark batch aggregation only: a compatible PySpark and Java installation
+- Network access to the configured public Greenhouse/Lever company-board endpoints
 
-Check Python and Java:
+Adapter, normalization, SQLite lifecycle, analytics, and dashboard-data tests use local fixtures and mocked HTTP responses; they do not need live API access or a JVM.
 
-```powershell
-python --version
-java -version
-```
+## Run the test suite
 
-If Java is not installed, install a JDK before attempting Spark-based streaming tasks.
-
-## 2. Open PowerShell in the Project Folder
-
-From the project root:
+Run the focused non-Spark tests:
 
 ```powershell
-cd "C:\Users\kekum\OneDrive\Desktop\CareerPulse"
+python -m pytest .\tests\test_generator.py .\tests\test_ingestion_sources.py .\tests\test_ingestion_sqlite.py .\tests\test_ingestion_service.py .\tests\test_analytics.py -q
 ```
 
-Verify the files exist:
+The tests in `tests\test_streaming.py` that exercise `process_batch()` create a real local Spark session. Run them separately when Java/PySpark is configured:
 
 ```powershell
-Get-ChildItem
+python -m pytest .\tests\test_streaming.py -q
 ```
 
-You should see the folders:
-- config/
-- data/
-- docs/
-- scripts/
-- src/
-- tests/
-- requirements.txt
-
-## 3. Create a Virtual Environment
-
-Create a virtual environment inside the project folder:
-
-```powershell
-python -m venv .venv
-```
-
-Activate it:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks the script due to execution policy, run this once:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
-```
-
-Confirm the virtual environment is active:
-
-```powershell
-python --version
-```
-
-You should see the Python version from the virtual environment.
-
-## 4. Install Project Dependencies
-
-Install the Python packages:
-
-```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-This installs dependencies such as:
-- kafka-python
-- pandas
-- pyarrow
-- streamlit
-- pytest
-- pyspark
-
-If installation fails due to a package restriction, try upgrading pip first and then rerun the install command.
-
-## 5. Check the Project Structure
-
-The project includes these main folders:
-
-```powershell
-Get-ChildItem .\src
-Get-ChildItem .\config
-Get-ChildItem .\tests
-```
-
-The most important folders and files:
-
-- src/generator/job_generator.py - Creates synthetic job events
-- src/streaming/kafka_producer.py - Sends events to Kafka or prints to stdout if Kafka is unavailable
-- src/streaming/spark_stream_processor.py - Validates stream records and detects event changes
-- src/storage/hbase_store.py - Simulated HBase job state storage
-- src/storage/parquet_store.py - Writes job records to Parquet/JSONL
-- src/analytics/trend_analytics.py - Computes hiring metrics
-- src/dashboard/app.py - Streamlit dashboard
-- scripts/run_pipeline.py - Runs the pipeline end-to-end
-
-## 6. Run the Test Suite
-
-Validate the project before running the full pipeline:
+The full suite combines both groups:
 
 ```powershell
 python -m pytest -q
 ```
 
-If you want to run only the relevant tests:
+## Configure public source accounts
+
+From the repository root:
 
 ```powershell
-python -m pytest tests/test_generator.py tests/test_streaming.py -q
+Copy-Item .\config\ingestion.example.json .\data\ingestion.local.json
 ```
 
-Expected result:
-- 5 tests pass
+Edit the copied file and set `enabled` to `true` only for board accounts you are authorized to query. Use the documented Greenhouse board token or Lever site identifier and the company name. For Lever, `region` is `global` or `eu`. The copied file is under the Git-ignored `data/` directory; do not commit account configuration.
 
-## 7. Generate Job Event Data
+Configuration fields:
 
-This generates a JSONL file with realistic job events.
+- `sqlite_path`: durable snapshots, lifecycle events, run stats, and optional raw pages
+- `raw_retention_days`: defaults to 7; set to `0` to disable raw-response retention
+- `request_timeout_seconds`: per-request timeout
+- `max_retries`: bounded retries for rate limits, server errors, and network failures
+- `spark`: settings used only by the explicit Spark batch option
+- `sources`: configured Greenhouse and Lever company accounts
+
+For source endpoint and consistency limitations, normalized fields, lifecycle rules, and retention details, see [ingestion documentation](./ingestion.md).
+
+## Run ingestion
+
+From the repository root:
+
+```powershell
+python -m src.ingestion.service --config .\data\ingestion.local.json
+```
+
+This runs source requests, normalizes valid listings, and atomically applies each complete source-account scan to SQLite. It reports per-account counts for new, modified, unchanged, and closed listings. A failed fetch or unverified scan is reported and does not advance that account's snapshot or absence evidence. The command exits nonzero if a configured account fails.
+
+To additionally perform real Spark DataFrame aggregation over the lifecycle events created by each successful scan:
+
+```powershell
+python -m src.ingestion.service --config .\data\ingestion.local.json --spark-batch
+```
+
+This flag starts Spark explicitly. Spark startup or processing failures remain visible. The SQLite source-state transaction commits before the optional Spark batch step; a subsequent Spark failure does not undo that committed ingestion run.
+
+## Run local demonstrations
+
+Generate synthetic job events:
 
 ```powershell
 python .\src\generator\job_generator.py --count 10 --output .\data\raw\job_events.jsonl
 ```
 
-To generate a specific event type for every record:
+Run the existing local synthetic pipeline:
 
 ```powershell
-python .\src\generator\job_generator.py --count 20 --event-type NEW --output .\data\raw\new_jobs.jsonl
+python .\scripts\run_pipeline.py
 ```
 
-Possible event types:
-- NEW
-- MODIFIED
-- CLOSED
-- DUPLICATE
+That script uses synthetic events and the existing local Parquet/JSONL helper. It does not run the public-source ingestion service.
 
-The generated file is JSON Lines format, one JSON object per line.
-
-## 8. Run the Kafka Producer
-
-The producer sends job events to Kafka when a Kafka broker is available.
+The Kafka producer is also separate:
 
 ```powershell
 python .\src\streaming\kafka_producer.py --bootstrap-servers localhost:9092 --topic job_events --count 25
 ```
 
-Notes:
-- If Kafka is not running, the code falls back to printing the events to stdout instead of crashing.
-- This is useful for local testing when you want to validate the producer flow without setting up a full broker.
+It can publish generated events when a broker is available; without `kafka-python`, it prints JSON to stdout. There is no CareerPulse Kafka consumer connected to the ingestion service.
 
-## 9. Run the Pipeline End-to-End
+## Run the dashboard
 
-This script generates sample events, summarizes stream results, writes data to Parquet, and prints analytics output.
+The dashboard reads active snapshots and lifecycle events from `.\data\processed\ingestion.sqlite3` if the database exists. To point it at another configured database:
 
 ```powershell
-python .\scripts\run_pipeline.py
-```
-
-What it does:
-1. Creates random job events
-2. Saves them in data/raw/
-3. Validates the records
-4. Computes stream summary counts
-5. Writes processed data to data/processed/
-6. Builds dashboard summary metrics
-
-You should see output similar to:
-
-```text
-Stream summary: {'DUPLICATE': 9, 'MODIFIED': 5, 'CLOSED': 7, 'NEW': 9}
-Dashboard summary: {...}
-Raw event file: data\raw\job_events.jsonl
-Processed data file: data\processed\job_history.parquet
-```
-
-## 10. Run the Dashboard
-
-Start the Streamlit app from the project root:
-
-```powershell
-streamlit run .\src\dashboard\app.py
-```
-
-If Streamlit is not recognized, try:
-
-```powershell
+$env:CAREERPULSE_SQLITE_PATH = ".\data\processed\ingestion.sqlite3"
 python -m streamlit run .\src\dashboard\app.py
 ```
 
-After the app starts, the terminal will show a local URL like:
+When no database exists, the dashboard says it is showing synthetic demo data. It does not silently use demo records when an existing database is invalid.
 
-```text
-Local URL: http://localhost:8501
-```
+The dashboard reports salary averages only from known scalar salaries. It does not substitute zero for unknown salary and does not calculate a midpoint from salary ranges.
 
-Open that URL in your browser to view the dashboard.
+## Current integration boundaries
 
-## 11. Explore Output Files
-
-After running the pipeline, inspect the generated files:
-
-```powershell
-Get-ChildItem .\data
-Get-ChildItem .\data\raw
-Get-ChildItem .\data\processed
-```
-
-Typical output files include:
-- data/raw/job_events.jsonl
-- data/processed/job_history.parquet
-- data/processed/demo_jobs.jsonl
-
-## 12. Optional: Start Kafka Manually
-
-If you want actual Kafka-based streaming rather than the fallback behavior, start a Kafka broker on your machine.
-
-Typical local setup:
-
-```powershell
-# Example placeholder - depends on your Kafka installation
-# Start ZooKeeper
-# Start Kafka server
-# Create a topic
-```
-
-Then send data to the topic using the producer script.
-
-Example:
-
-```powershell
-python .\src\streaming\kafka_producer.py --bootstrap-servers localhost:9092 --topic job_events --count 50
-```
-
-## 13. Optional: Run the Generator with a Fixed Event Type
-
-This lets you simulate one kind of job event at a time:
-
-```powershell
-python .\src\generator\job_generator.py --count 50 --event-type MODIFIED --output .\data\raw\modified_jobs.jsonl
-```
-
-## 14. Troubleshooting
-
-### Problem: `ModuleNotFoundError: No module named 'src'`
-
-This usually happens when running a script from the wrong working directory.
-
-Fix:
-
-```powershell
-cd "C:\Users\kekum\OneDrive\Desktop\CareerPulse"
-python .\scripts\run_pipeline.py
-```
-
-### Problem: `streamlit` not found
-
-Install dependencies again:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-### Problem: Kafka connection errors
-
-The code gracefully falls back to stdout when Kafka is not available, but for true streaming you need a running Kafka broker.
-
-### Problem: PySpark JDK or environment issues
-
-Install a JDK and confirm it is reachable:
-
-```powershell
-java -version
-```
-
-### Problem: tests fail
-
-Run the exact tests again:
-
-```powershell
-python -m pytest tests/test_generator.py tests/test_streaming.py -q
-```
-
-## 15. Recommended Local Workflow
-
-For a normal development cycle, run the project in this sequence:
-
-```powershell
-cd "C:\Users\kekum\OneDrive\Desktop\CareerPulse"
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m pytest -q
-python .\scripts\run_pipeline.py
-streamlit run .\src\dashboard\app.py
-```
-
-## 16. Summary
-
-This project can be run in three main modes:
-
-1. Offline local simulation
-   - generate records
-   - run pipeline directly
-   - view dashboard
-
-2. Kafka producer mode
-   - send events to Kafka
-   - use it with an active broker
-
-3. Analytics validation mode
-   - run tests
-   - inspect JSONL and Parquet outputs
-   - confirm metrics are generated correctly
-
-This gives you a working local Big Data architecture scaffold for CareerPulse without needing a full production-scale infrastructure setup.
+- Greenhouse and Lever public company-board fetching, normalization, and per-account SQLite lifecycle snapshots are implemented.
+- Spark is used only for explicit local batch event aggregation. No Structured Streaming source/sink is wired.
+- Kafka producer, in-memory HBase-shaped storage, and Parquet helper remain independent examples and are not downstream sinks for the public ingestion service.
+- No global job search, LinkedIn/Indeed access, ML prediction, or production deployment is implemented.

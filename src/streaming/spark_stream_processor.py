@@ -42,20 +42,20 @@ class SparkJobStreamProcessor:
         self.spark = SparkSession.builder.appName(app_name).master(master).getOrCreate()
 
     def process_batch(self, records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
-        valid_records = []
+        valid_events = []
         for record in records:
             ok, _ = validate_record(record)
             if not ok:
                 continue
             event_name = str(record.get("event", "")).upper()
             if event_name:
-                valid_records.append({**record, "event": event_name})
+                valid_events.append(event_name)
 
-        if not valid_records:
+        if not valid_events:
             return {}
 
         event_counts = (
-            self.spark.createDataFrame(valid_records)
+            self.spark.createDataFrame([(event,) for event in valid_events], ["event"])
             .groupBy("event")
             .count()
             .collect()

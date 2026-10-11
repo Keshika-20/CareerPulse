@@ -108,9 +108,10 @@ def test_process_batch_uses_spark_dataframe_aggregation(spark_processor):
         {"job_id": "J1", "company": "Google", "title": "Engineer", "location": "Bangalore", "experience": "0-2 years", "salary": 1000000, "timestamp": "2026-10-06T00:00:00Z", "event": "NEW"},
         {"job_id": "J2", "company": "Amazon", "title": "Engineer", "location": "Hyderabad", "experience": "2-4 years", "salary": 1200000, "timestamp": "2026-10-06T00:01:00Z", "event": "MODIFIED"},
         {"job_id": "J3", "company": "Microsoft", "title": "Data Engineer", "location": "Remote", "experience": "4-6 years", "salary": 1500000, "timestamp": "2026-10-06T00:02:00Z", "event": "new"},
+        {"job_id": "J4", "company": "Acme", "title": "Analyst", "location": "Remote", "experience": None, "salary": None, "timestamp": "2026-10-06T00:03:00Z", "event": "CLOSED"},
     ]
 
-    assert spark_processor.process_batch(records) == {"NEW": 2, "MODIFIED": 1}
+    assert spark_processor.process_batch(records) == {"NEW": 2, "MODIFIED": 1, "CLOSED": 1}
 
 
 def test_process_batch_excludes_invalid_records(spark_processor):
