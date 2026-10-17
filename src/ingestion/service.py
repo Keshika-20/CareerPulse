@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -20,13 +21,17 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
         with path.open("r", encoding="utf-8") as handle:
             config = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Unable to read ingestion config at {path}: {exc}") from exc
+        raise ValueError(
+            f"Unable to read ingestion config at {path}: {exc}"
+        ) from exc
+
     if not isinstance(config, dict):
         raise ValueError("Ingestion configuration must be a JSON object.")
 
     database_path = config.get("sqlite_path")
     if not isinstance(database_path, str) or not database_path.strip():
         raise ValueError("sqlite_path must be a non-empty string.")
+
     retention_days = config.get("raw_retention_days", 7)
     if (
         isinstance(retention_days, bool)
@@ -34,6 +39,7 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
         or retention_days < 0
     ):
         raise ValueError("raw_retention_days must be a non-negative integer.")
+
     timeout_seconds = config.get("request_timeout_seconds", 15)
     if (
         isinstance(timeout_seconds, bool)
@@ -41,6 +47,7 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
         or timeout_seconds <= 0
     ):
         raise ValueError("request_timeout_seconds must be a positive number.")
+
     retries = config.get("max_retries", 2)
     if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
         raise ValueError("max_retries must be a non-negative integer.")
@@ -48,40 +55,86 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
     sources = config.get("sources", {})
     if not isinstance(sources, dict):
         raise ValueError("sources must be an object.")
+
     unknown_sources = set(sources) - {"greenhouse", "lever"}
     if unknown_sources:
-        raise ValueError(f"Unsupported source types: {', '.join(sorted(unknown_sources))}.")
+        raise ValueError(
+            f"Unsupported source types: {', '.join(sorted(unknown_sources))}."
+        )
+
     for source_name in ("greenhouse", "lever"):
         accounts = sources.get(source_name, [])
         if not isinstance(accounts, list):
             raise ValueError(f"sources.{source_name} must be a list.")
+
         for index, account in enumerate(accounts):
             if not isinstance(account, dict):
-                raise ValueError(f"sources.{source_name}[{index}] must be an object.")
+                raise ValueError(
+                    f"sources.{source_name}[{index}] must be an object."
+                )
+
             if "enabled" in account and not isinstance(account["enabled"], bool):
                 raise ValueError(
                     f"sources.{source_name}[{index}].enabled must be a boolean."
                 )
+
             if account.get("enabled", False) and (
                 not isinstance(account.get("company"), str)
                 or not account["company"].strip()
             ):
                 raise ValueError(
-                    f"Enabled sources.{source_name}[{index}] requires a company name."
+                    f"Enabled sources.{source_name}[{index}] "
+                    "requires a company name."
                 )
+
             if source_name == "greenhouse" and account.get("enabled", False):
-                if not isinstance(account.get("board_token"), str) or not account["board_token"].strip():
+                token = account.get("board_token")
+                if not isinstance(token, str) or not token.strip():
                     raise ValueError(
-                        f"Enabled sources.greenhouse[{index}] requires board_token."
+                        f"Enabled sources.greenhouse[{index}] "
+                        "requires board_token."
                     )
+
             if source_name == "lever" and account.get("enabled", False):
-                if not isinstance(account.get("site"), str) or not account["site"].strip():
-                    raise ValueError(f"Enabled sources.lever[{index}] requires site.")
+                site = account.get("site")
+                if not isinstance(site, str) or not site.strip():
+                    raise ValueError(
+                        f"Enabled sources.lever[{index}] requires site."
+                    )
+
                 region = account.get("region", "global")
                 if not isinstance(region, str) or region not in {"global", "eu"}:
                     raise ValueError(
                         f"sources.lever[{index}].region must be 'global' or 'eu'."
                     )
+
+    # Kafka configuration is optional. Validate it only when supplied.
+    kafka_config = config.get("kafka", {})
+    if not isinstance(kafka_config, dict):
+        raise ValueError("kafka must be a JSON object.")
+
+    bootstrap_servers = kafka_config.get("bootstrap_servers", "localhost:9092")
+    if (
+        not isinstance(bootstrap_servers, str)
+        or not bootstrap_servers.strip()
+        or any(not server.strip() for server in bootstrap_servers.split(","))
+    ):
+        raise ValueError(
+            "kafka.bootstrap_servers must be a non-empty comma-separated string."
+        )
+
+    topic = kafka_config.get("topic", "job-events")
+    if not isinstance(topic, str) or not topic.strip():
+        raise ValueError("kafka.topic must be a non-empty string.")
+
+    kafka_timeout = kafka_config.get("timeout_seconds", 10)
+    if (
+        isinstance(kafka_timeout, bool)
+        or not isinstance(kafka_timeout, (int, float))
+        or kafka_timeout <= 0
+    ):
+        raise ValueError("kafka.timeout_seconds must be a positive number.")
+
     return config
 
 
@@ -91,10 +144,12 @@ class IngestionService:
         config: Dict[str, Any],
         *,
         with_spark: bool = False,
+        with_kafka: bool = False,
         http_client: Optional[JsonHttpClient] = None,
     ) -> None:
         self.config = config
         self.with_spark = with_spark
+        self.with_kafka = with_kafka
         self.http_client = http_client or JsonHttpClient(
             timeout_seconds=config.get("request_timeout_seconds", 15),
             max_retries=config.get("max_retries", 2),
@@ -102,6 +157,7 @@ class IngestionService:
 
     def run(self) -> Dict[str, Any]:
         enabled_sources = []
+
         for source_name, accounts in self.config.get("sources", {}).items():
             if source_name in {"greenhouse", "lever"}:
                 enabled_sources.extend(
@@ -109,50 +165,79 @@ class IngestionService:
                     for account in accounts
                     if account.get("enabled", False)
                 )
+
         if not enabled_sources:
-            raise ValueError("No Greenhouse or Lever accounts are enabled in the config.")
+            raise ValueError(
+                "No Greenhouse or Lever accounts are enabled in the config."
+            )
 
         store = SQLiteSnapshotStore(
             self.config["sqlite_path"],
             raw_retention_days=self.config.get("raw_retention_days", 7),
         )
+
         processor = None
+        kafka_producer = None
         results = []
         failures = []
+
         try:
             if self.with_spark:
-                from src.streaming.spark_stream_processor import SparkJobStreamProcessor
+                from src.streaming.spark_stream_processor import (
+                    SparkJobStreamProcessor,
+                )
 
                 spark_config = self.config.get("spark", {})
                 processor = SparkJobStreamProcessor(
-                    app_name=spark_config.get("app_name", "CareerPulse Ingestion Batch"),
+                    app_name=spark_config.get(
+                        "app_name", "CareerPulse Ingestion Batch"
+                    ),
                     master=spark_config.get("master", "local[*]"),
+                )
+
+            if self.with_kafka:
+                from src.streaming.kafka_producer import KafkaJobProducer
+
+                kafka_config = self.config.get("kafka", {})
+                kafka_producer = KafkaJobProducer(
+                    bootstrap_servers=kafka_config.get(
+                        "bootstrap_servers", "localhost:9092"
+                    ),
+                    topic=kafka_config.get("topic", "job-events"),
+                    timeout_seconds=kafka_config.get("timeout_seconds", 10),
                 )
 
             greenhouse = GreenhouseSource(self.http_client)
             lever = LeverSource(self.http_client)
+
             for source_name, account in enabled_sources:
                 account_id = (
                     account["board_token"]
                     if source_name == "greenhouse"
                     else f"{account.get('region', 'global')}:{account['site']}"
                 )
+
                 try:
                     if source_name == "greenhouse":
-                        scan = greenhouse.fetch(account["board_token"], account["company"])
+                        scan = greenhouse.fetch(
+                            account["board_token"], account["company"]
+                        )
                     else:
                         scan = lever.fetch(
                             account["site"],
                             account["company"],
                             region=account.get("region", "global"),
                         )
+
                     observed_at = datetime.now(timezone.utc).isoformat()
                     listings = normalize_scan(scan, observed_at=observed_at)
+
                 except (SourceFetchError, ValueError) as exc:
                     failures.append(
                         {
                             "source": source_name,
                             "account_id": account_id,
+                            "stage": "fetch_or_normalize",
                             "error": str(exc),
                         }
                     )
@@ -169,26 +254,63 @@ class IngestionService:
                         {
                             "source": source_name,
                             "account_id": account_id,
+                            "stage": "persist_scan",
                             "error": str(exc),
                         }
                     )
                     continue
 
+                # Publish only persisted lifecycle events for this scan.
+                run_events = store.list_events_for_run(run_stats["run_id"])
+
                 if processor is not None:
-                    run_events = store.list_events_for_run(run_stats["run_id"])
-                    run_stats["spark_event_counts"] = processor.process_batch(run_events)
+                    run_stats["spark_event_counts"] = processor.process_batch(
+                        run_events
+                    )
+
+                if kafka_producer is not None:
+                    published_count = 0
+
+                    try:
+                        for event in run_events:
+                            kafka_producer.send_event(event)
+                            published_count += 1
+
+                        run_stats["kafka_published"] = published_count
+
+                    except Exception as exc:
+                        # Some earlier events may already have reached Kafka.
+                        run_stats["kafka_published"] = published_count
+                        failures.append(
+                            {
+                                "source": source_name,
+                                "account_id": account_id,
+                                "stage": "kafka_publish",
+                                "run_id": run_stats["run_id"],
+                                "error": str(exc),
+                                "published_before_failure": published_count,
+                            }
+                        )
+
                 results.append(run_stats)
+
         finally:
-            store.close()
-            if processor is not None:
-                processor.close()
+            try:
+                if kafka_producer is not None:
+                    kafka_producer.close()
+            finally:
+                try:
+                    store.close()
+                finally:
+                    if processor is not None:
+                        processor.close()
 
         return {"runs": results, "failures": failures}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fetch configured public Greenhouse and Lever job boards."
+        description="Fetch public Greenhouse and Lever job boards."
     )
     parser.add_argument(
         "--config",
@@ -198,13 +320,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--spark-batch",
         action="store_true",
-        help="Run genuine Spark DataFrame aggregation on persisted lifecycle events.",
+        help="Run Spark aggregation on persisted lifecycle events.",
     )
+    parser.add_argument(
+        "--kafka",
+        action="store_true",
+        help="Publish persisted lifecycle events to Kafka.",
+    )
+
     args = parser.parse_args(argv)
+
     try:
         config = load_config(args.config)
-        result = IngestionService(config, with_spark=args.spark_batch).run()
-    except (OSError, ValueError, RuntimeError) as exc:
+        result = IngestionService(
+            config,
+            with_spark=args.spark_batch,
+            with_kafka=args.kafka,
+        ).run()
+    except Exception as exc:
         print(f"Ingestion failed: {exc}", file=sys.stderr)
         return 1
 
