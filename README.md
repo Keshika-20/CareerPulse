@@ -14,6 +14,17 @@ Kafka consumer integration, PySpark Structured Streaming, HBase persistence, ing
 
 The historical architecture sections below describe a target design, not the current runtime pipeline.
 
+## Current dashboard workspace
+
+The Streamlit dashboard includes four views:
+
+- **Overview:** active listings, represented companies and sources, lifecycle totals, company distribution, and recent changes.
+- **Job explorer:** search and filter active jobs by title/company/location/source, inspect listing details, open the original provider posting, and export filtered results as CSV.
+- **Pipeline control:** view the ingestion stages, launch the existing ingestion service from the UI, and inspect latest source-account scans and run history.
+- **Lifecycle events:** filter the recent persisted NEW/MODIFIED/CLOSED audit trail and export it as CSV.
+
+The dashboard reads the configured SQLite database in read-only mode. Use the sidebar's database field or `CAREERPULSE_SQLITE_PATH` to select the database. The pipeline control view runs the ordinary Python ingestion command; it does not silently enable Spark. Only configured and enabled public source accounts are fetched. If only one Greenhouse account is enabled, the dashboard will only contain that account's postings; add additional verified Greenhouse board tokens and/or Lever site identifiers to your local ingestion configuration to expand coverage.
+
 ## 1. Project Goal
 The implemented workflow fetches public listings for configured company boards and tracks cross-run changes. A separate synthetic generator remains available for local demonstrations. The current ingestion workflow is batch-oriented, not real time. It can record:
 
