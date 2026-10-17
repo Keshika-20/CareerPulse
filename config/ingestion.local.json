@@ -1,0 +1,28 @@
+{
+  "sqlite_path": "./data/processed/ingestion.sqlite3",
+  "raw_retention_days": 7,
+  "request_timeout_seconds": 15,
+  "max_retries": 2,
+  "spark": {
+    "app_name": "CareerPulse Ingestion Batch",
+    "master": "local[*]"
+  },
+  "sources": {
+  
+    "greenhouse": [
+  {
+    "enabled": true,
+    "board_token": "greenhouse",
+    "company": "Greenhouse"
+  }
+],
+    "lever": [
+      {
+        "enabled": false,
+        "site": "REPLACE_WITH_VERIFIED_LEVER_SITE",
+        "region": "global",
+        "company": "Replace with company name"
+      }
+    ]
+  }
+}

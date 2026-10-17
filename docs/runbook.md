@@ -104,7 +104,9 @@ python -m streamlit run .\src\dashboard\app.py
 
 When no database exists, the dashboard says it is showing synthetic demo data. It does not silently use demo records when an existing database is invalid.
 
-The dashboard reports salary averages only from known scalar salaries. It does not substitute zero for unknown salary and does not calculate a midpoint from salary ranges.
+The dashboard provides Overview, Job explorer, Pipeline control, and Lifecycle events views. The explorer supports text search and company/source/location filters, listing details, original-posting links, and CSV export. Pipeline control can launch the normal ingestion service using the selected configuration and shows recent per-account run statistics. The lifecycle view filters persisted events and supports CSV export.
+
+The dashboard reads the SQLite database in read-only mode. It reports salary information only when the source provides it; unknown salary is not treated as zero, and salary ranges are not converted to an invented scalar or midpoint. The dashboard does not automatically discover all employers: it displays listings from configured and enabled public company boards only.
 
 ## Current integration boundaries
 

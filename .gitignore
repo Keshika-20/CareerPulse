@@ -1,7 +1,9 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.pyc
 .env
 *.log
 data/
 .venv-spark/
+# Local OIDC credentials and app secrets
+.streamlit/secrets.toml

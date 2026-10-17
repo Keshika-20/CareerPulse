@@ -89,7 +89,8 @@ class SQLiteSnapshotStore:
                 job_id TEXT NOT NULL,
                 event_type TEXT NOT NULL CHECK (event_type IN ('NEW', 'MODIFIED', 'CLOSED')),
                 event_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL
+                payload_json TEXT NOT NULL,
+                kafka_status TEXT CHECK (kafka_status IN ('pending', 'published'))
             );
             CREATE INDEX IF NOT EXISTS idx_lifecycle_events_job
                 ON lifecycle_events (job_id, event_id);
@@ -99,6 +100,22 @@ class SQLiteSnapshotStore:
                 captured_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+            """
+        )
+        # Databases created before Kafka delivery tracking lack this column.
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(lifecycle_events)")
+        }
+        if "kafka_status" not in columns:
+            self._connection.execute(
+                "ALTER TABLE lifecycle_events ADD COLUMN kafka_status TEXT "
+                "CHECK (kafka_status IN ('pending', 'published'))"
+            )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lifecycle_events_kafka_pending
+                ON lifecycle_events (event_id) WHERE kafka_status = 'pending'
             """
         )
 
@@ -168,8 +185,13 @@ class SQLiteSnapshotStore:
         scan: SourceScan,
         listings: Iterable[Dict[str, Any]],
         observed_at: Optional[str] = None,
+        *,
+        queue_for_kafka: bool = False,
     ) -> Dict[str, Any]:
         normalized = self._validate_scan(scan, listings)
+        # Queued in the same transaction as the events, so a crash cannot
+        # commit lifecycle changes that Kafka will never be offered.
+        kafka_status = "pending" if queue_for_kafka else None
         scan_at = self._observation_timestamp(observed_at)
         run_id = str(uuid.uuid4())
         counts = {"new": 0, "modified": 0, "unchanged": 0, "closed": 0}
@@ -213,12 +235,12 @@ class SQLiteSnapshotStore:
                     event_type = "NEW"
                     counts["new"] += 1
                     event_payload = self._event_payload(listing, event_type, scan_at)
-                    self._insert_event(connection, run_id, listing["job_id"], event_payload)
+                    self._insert_event(connection, run_id, listing["job_id"], event_payload, kafka_status)
                 elif self._changed(old_payload, listing):
                     event_type = "MODIFIED"
                     counts["modified"] += 1
                     event_payload = self._event_payload(listing, event_type, scan_at)
-                    self._insert_event(connection, run_id, listing["job_id"], event_payload)
+                    self._insert_event(connection, run_id, listing["job_id"], event_payload, kafka_status)
                 else:
                     counts["unchanged"] += 1
 
@@ -255,7 +277,7 @@ class SQLiteSnapshotStore:
                 if next_absences >= 2:
                     old_payload = json.loads(previous["payload_json"])
                     close_payload = self._event_payload(old_payload, "CLOSED", scan_at)
-                    self._insert_event(connection, run_id, job_id, close_payload)
+                    self._insert_event(connection, run_id, job_id, close_payload, kafka_status)
                     connection.execute(
                         """
                         UPDATE job_snapshots
@@ -313,13 +335,15 @@ class SQLiteSnapshotStore:
                         json.dumps(scan.raw_pages, sort_keys=True, allow_nan=False),
                     ),
                 )
-                connection.execute(
-                    """
-                    DELETE FROM raw_snapshots
-                    WHERE captured_at < datetime(?, ?)
-                    """,
-                    (scan_at, f"-{self.raw_retention_days} days"),
-                )
+            # Prune even when retention is 0 so payloads kept under an earlier
+            # setting do not linger. Compare parsed datetimes, not ISO strings.
+            connection.execute(
+                """
+                DELETE FROM raw_snapshots
+                WHERE datetime(captured_at) < datetime(?, ?)
+                """,
+                (scan_at, f"-{self.raw_retention_days} days"),
+            )
 
         return {
             "run_id": run_id,
@@ -335,12 +359,13 @@ class SQLiteSnapshotStore:
         run_id: str,
         job_id: str,
         payload: Dict[str, Any],
+        kafka_status: Optional[str] = None,
     ) -> None:
         connection.execute(
             """
             INSERT INTO lifecycle_events
-                (run_id, job_id, event_type, event_at, payload_json)
-            VALUES (?, ?, ?, ?, ?)
+                (run_id, job_id, event_type, event_at, payload_json, kafka_status)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -348,6 +373,7 @@ class SQLiteSnapshotStore:
                 payload["event"],
                 payload["timestamp"],
                 json.dumps(payload, sort_keys=True, allow_nan=False),
+                kafka_status,
             ),
         )
 
@@ -402,15 +428,32 @@ class SQLiteSnapshotStore:
             """,
             (run_id,),
         ).fetchall()
-        return [
-            {
-                "job_id": row["job_id"],
-                "event": row["event_type"],
-                "timestamp": row["event_at"],
-                **json.loads(row["payload_json"]),
-            }
-            for row in rows
-        ]
+        return [self._flat_event(row) for row in rows]
+
+    @staticmethod
+    def _flat_event(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "job_id": row["job_id"],
+            "event": row["event_type"],
+            "timestamp": row["event_at"],
+            **json.loads(row["payload_json"]),
+        }
+
+    def list_pending_kafka_events(self) -> list[tuple[int, Dict[str, Any]]]:
+        """Return (event_id, event) pairs not yet acknowledged by Kafka, oldest first."""
+        rows = self._connection.execute(
+            """
+            SELECT event_id, job_id, event_type, event_at, payload_json
+            FROM lifecycle_events WHERE kafka_status = 'pending' ORDER BY event_id
+            """
+        ).fetchall()
+        return [(row["event_id"], self._flat_event(row)) for row in rows]
+
+    def mark_kafka_published(self, event_id: int) -> None:
+        self._connection.execute(
+            "UPDATE lifecycle_events SET kafka_status = 'published' WHERE event_id = ?",
+            (event_id,),
+        )
 
     def list_active_snapshots(self) -> list[Dict[str, Any]]:
         rows = self._connection.execute(
