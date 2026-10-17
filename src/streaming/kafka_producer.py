@@ -18,14 +18,9 @@ try:
     from kafka.serializer import Serializer
 except ImportError:  # pragma: no cover
     KafkaProducer = None
-    Serializer = None
+    # Keeps the module importable so KafkaJobProducer can raise a clear error.
+    Serializer = object
 
-
-# class JsonSerializer(Serializer):
-#     """Serialize Python event dictionaries into UTF-8 JSON bytes."""
-
-#     def serialize(self, value: dict) -> bytes:
-#         return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
 class JsonSerializer(Serializer):
     """Serialize Python event dictionaries into UTF-8 JSON bytes."""
@@ -44,7 +39,7 @@ class KafkaJobProducer:
         topic: str = "job-events",
         timeout_seconds: float = 10,
     ) -> None:
-        if KafkaProducer is None or Serializer is None:
+        if KafkaProducer is None:
             raise RuntimeError(
                 "Kafka publishing requires kafka-python. "
                 "Install it with: pip install kafka-python"

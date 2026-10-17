@@ -21,14 +21,15 @@ analyst_emails = ["your-analyst-email@example.com"]
 viewer_emails = ["your-viewer-email@example.com"]
 ```
 
-3. Generate a random cookie secret; never reuse your OAuth client secret as the cookie secret. Keep `.streamlit/secrets.toml` out of Git and configure equivalent secrets in your deployment environment.
+3. All five `[auth]` values are required; the sign-in page lists any that are missing. Generate a random cookie secret (for example `python -c "import secrets; print(secrets.token_urlsafe(48))"`); never reuse your OAuth client secret as the cookie secret. Keep `.streamlit/secrets.toml` out of Git and configure equivalent secrets in your deployment environment.
 4. Restart with `python -m streamlit run .\src\dashboard\app.py`. Users sign in through the configured identity provider and log out using the sidebar.
 
 Role policy:
 - `admin`: full workspace access, can execute ingestion and Spark batch runs.
 - `analyst`: can inspect pipeline run history and events but cannot execute pipeline jobs.
 - `viewer`: read-only overview, job explorer, Big Data status, and event views.
-- Unknown authenticated emails default to `viewer`. Configure explicit allowlists; do not infer roles from user-supplied form values.
+- Signed-in emails that appear on no list are denied access and offered a logout. Every user, including viewers, must be listed explicitly.
+- Only `admin` can change which SQLite database the dashboard reads; other roles use `CAREERPULSE_SQLITE_PATH` or the default path.
 
 OIDC authenticates the user; role allowlists authorize workspace capabilities. For a public production deployment, also configure HTTPS, secret management, provider-side MFA, and appropriate database/file-system access. Streamlit's single-process/local database design is a student-project deployment, not a substitute for a multi-tenant backend service.
 

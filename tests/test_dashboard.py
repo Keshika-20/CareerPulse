@@ -59,7 +59,7 @@ def test_salary_format_preserves_unknown_and_ranges():
     }) == "USD 90,000–120,000 / year"
 
 
-def test_role_resolution_is_case_insensitive_and_least_privilege():
+def test_role_resolution_is_case_insensitive_and_denies_unlisted_emails():
     from src.dashboard.app import resolve_role
 
     config = {
@@ -70,8 +70,9 @@ def test_role_resolution_is_case_insensitive_and_least_privilege():
     assert resolve_role("admin@example.com", config) == "admin"
     assert resolve_role("ANALYST@example.com", config) == "analyst"
     assert resolve_role("viewer@example.com", config) == "viewer"
-    assert resolve_role("unknown@example.com", config) == "viewer"
-    assert resolve_role("", config) == "viewer"
+    assert resolve_role("unknown@example.com", config) is None
+    assert resolve_role("", config) is None
+    assert resolve_role("anyone@example.com", {}) is None
 
 
 def test_admin_role_has_precedence_if_email_is_misconfigured_in_multiple_lists():
@@ -81,3 +82,42 @@ def test_admin_role_has_precedence_if_email_is_misconfigured_in_multiple_lists()
         "admin_emails": ["same@example.com"],
         "analyst_emails": ["same@example.com"],
     }) == "admin"
+
+
+def test_run_ingestion_builds_command_with_optional_spark(monkeypatch, tmp_path):
+    import subprocess
+
+    from src.dashboard import app
+
+    config = tmp_path / "ingestion.json"
+    config.write_text("{}")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout='{"runs": []}', stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+    assert app._run_ingestion(str(config)) == (0, '{"runs": []}')
+    assert app._run_ingestion(str(config), spark_batch=True)[0] == 0
+    assert "--spark-batch" not in commands[0]
+    assert commands[1][-1] == "--spark-batch"
+    assert commands[0][1:4] == ["-m", "src.ingestion.service", "--config"]
+
+
+def test_run_ingestion_reports_missing_config(tmp_path):
+    from src.dashboard.app import _run_ingestion
+
+    code, message = _run_ingestion(str(tmp_path / "missing.json"))
+    assert code == 2
+    assert "Config file not found" in message
+
+
+def test_missing_auth_settings_includes_cookie_secret():
+    from src.dashboard.app import REQUIRED_AUTH_SETTINGS, missing_auth_settings
+
+    complete = {name: "value" for name in REQUIRED_AUTH_SETTINGS}
+    assert missing_auth_settings(complete) == []
+    assert missing_auth_settings({**complete, "cookie_secret": ""}) == ["cookie_secret"]
+    assert missing_auth_settings({}) == list(REQUIRED_AUTH_SETTINGS)

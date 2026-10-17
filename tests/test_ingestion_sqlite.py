@@ -245,3 +245,75 @@ def test_raw_response_retention_is_configurable_and_prunes_old_payloads(tmp_path
 def test_raw_retention_rejects_invalid_values(tmp_path):
     with pytest.raises(ValueError):
         SQLiteSnapshotStore(tmp_path / "invalid.sqlite3", raw_retention_days=-1)
+
+
+def test_switching_retention_to_zero_prunes_previously_kept_payloads(tmp_path):
+    database = tmp_path / "ingestion.sqlite3"
+    store = SQLiteSnapshotStore(database, raw_retention_days=7)
+    apply(store, [make_listing("posting-1")], "2026-01-01T00:00:00Z")
+    assert store.raw_snapshot_count() == 1
+    store.close()
+
+    store = SQLiteSnapshotStore(database, raw_retention_days=0)
+    apply(store, [make_listing("posting-1")], "2026-01-02T00:00:00Z")
+    assert store.raw_snapshot_count() == 0
+    store.close()
+
+
+def test_raw_retention_prunes_payload_just_past_cutoff_on_same_day(tmp_path):
+    store = SQLiteSnapshotStore(tmp_path / "ingestion.sqlite3", raw_retention_days=1)
+    apply(store, [], "2026-01-01T06:00:00Z")
+    apply(store, [], "2026-01-02T12:00:00Z")
+    assert store.raw_snapshot_count() == 1
+    store.close()
+
+
+def test_kafka_queue_is_written_with_scan_and_drained_by_acknowledgement(tmp_path):
+    store = SQLiteSnapshotStore(tmp_path / "ingestion.sqlite3")
+    store.apply_scan(
+        make_scan(["posting-1", "posting-2"]),
+        [make_listing("posting-1"), make_listing("posting-2")],
+        observed_at="2026-01-01T00:00:00Z",
+        queue_for_kafka=True,
+    )
+    pending = store.list_pending_kafka_events()
+    assert [event["job_id"] for _, event in pending] == [
+        f"lever:{ACCOUNT}:posting-1",
+        f"lever:{ACCOUNT}:posting-2",
+    ]
+    assert all(event["event"] == "NEW" for _, event in pending)
+
+    store.mark_kafka_published(pending[0][0])
+    assert [event_id for event_id, _ in store.list_pending_kafka_events()] == [pending[1][0]]
+    store.close()
+
+
+def test_scan_without_kafka_queues_nothing(tmp_path):
+    store = SQLiteSnapshotStore(tmp_path / "ingestion.sqlite3")
+    apply(store, [make_listing("posting-1")], "2026-01-01T00:00:00Z")
+    assert store.list_pending_kafka_events() == []
+    store.close()
+
+
+def test_existing_database_gains_kafka_status_column(tmp_path):
+    database = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE lifecycle_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = SQLiteSnapshotStore(database)
+    apply(store, [make_listing("posting-1")], "2026-01-01T00:00:00Z")
+    assert store.list_pending_kafka_events() == []
+    store.close()

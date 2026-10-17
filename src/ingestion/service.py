@@ -178,6 +178,7 @@ class IngestionService:
 
         processor = None
         kafka_producer = None
+        kafka_stats: Optional[Dict[str, int]] = None
         results = []
         failures = []
 
@@ -199,13 +200,23 @@ class IngestionService:
                 from src.streaming.kafka_producer import KafkaJobProducer
 
                 kafka_config = self.config.get("kafka", {})
-                kafka_producer = KafkaJobProducer(
-                    bootstrap_servers=kafka_config.get(
-                        "bootstrap_servers", "localhost:9092"
-                    ),
-                    topic=kafka_config.get("topic", "job-events"),
-                    timeout_seconds=kafka_config.get("timeout_seconds", 10),
-                )
+                try:
+                    kafka_producer = KafkaJobProducer(
+                        bootstrap_servers=kafka_config.get(
+                            "bootstrap_servers", "localhost:9092"
+                        ),
+                        topic=kafka_config.get("topic", "job-events"),
+                        timeout_seconds=kafka_config.get("timeout_seconds", 10),
+                    )
+                except Exception as exc:
+                    # An unreachable broker must not block ingestion: events are
+                    # still queued below and delivered by a later --kafka run.
+                    failures.append(
+                        {
+                            "stage": "kafka_connect",
+                            "error": str(exc) or type(exc).__name__,
+                        }
+                    )
 
             greenhouse = GreenhouseSource(self.http_client)
             lever = LeverSource(self.http_client)
@@ -248,6 +259,7 @@ class IngestionService:
                         scan,
                         listings,
                         observed_at=observed_at,
+                        queue_for_kafka=self.with_kafka,
                     )
                 except IncompleteScanError as exc:
                     failures.append(
@@ -260,39 +272,21 @@ class IngestionService:
                     )
                     continue
 
-                # Publish only persisted lifecycle events for this scan.
-                run_events = store.list_events_for_run(run_stats["run_id"])
-
                 if processor is not None:
+                    run_events = store.list_events_for_run(run_stats["run_id"])
                     run_stats["spark_event_counts"] = processor.process_batch(
                         run_events
                     )
 
-                if kafka_producer is not None:
-                    published_count = 0
-
-                    try:
-                        for event in run_events:
-                            kafka_producer.send_event(event)
-                            published_count += 1
-
-                        run_stats["kafka_published"] = published_count
-
-                    except Exception as exc:
-                        # Some earlier events may already have reached Kafka.
-                        run_stats["kafka_published"] = published_count
-                        failures.append(
-                            {
-                                "source": source_name,
-                                "account_id": account_id,
-                                "stage": "kafka_publish",
-                                "run_id": run_stats["run_id"],
-                                "error": str(exc),
-                                "published_before_failure": published_count,
-                            }
-                        )
-
                 results.append(run_stats)
+
+            if kafka_producer is not None:
+                kafka_stats = self._publish_pending(store, kafka_producer, failures)
+            elif self.with_kafka:
+                kafka_stats = {
+                    "published": 0,
+                    "pending": len(store.list_pending_kafka_events()),
+                }
 
         finally:
             try:
@@ -305,7 +299,40 @@ class IngestionService:
                     if processor is not None:
                         processor.close()
 
-        return {"runs": results, "failures": failures}
+        result: Dict[str, Any] = {"runs": results, "failures": failures}
+        if kafka_stats is not None:
+            result["kafka"] = kafka_stats
+        return result
+
+    @staticmethod
+    def _publish_pending(
+        store: SQLiteSnapshotStore,
+        kafka_producer: Any,
+        failures: list,
+    ) -> Dict[str, int]:
+        """Deliver every queued event, including ones left by earlier failed runs.
+
+        An event is marked published only after Kafka acknowledges it; anything
+        unsent stays pending for the next --kafka run (at-least-once delivery).
+        """
+        pending = store.list_pending_kafka_events()
+        published = 0
+        for event_id, event in pending:
+            try:
+                kafka_producer.send_event(event)
+            except Exception as exc:
+                failures.append(
+                    {
+                        "stage": "kafka_publish",
+                        "error": str(exc),
+                        "published_before_failure": published,
+                        "left_pending": len(pending) - published,
+                    }
+                )
+                break
+            store.mark_kafka_published(event_id)
+            published += 1
+        return {"published": published, "pending": len(pending) - published}
 
 
 def main(argv: Optional[list[str]] = None) -> int:

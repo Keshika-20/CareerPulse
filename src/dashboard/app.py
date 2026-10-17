@@ -179,8 +179,8 @@ def _safe_date(value: Any) -> str:
         return str(value)
 
 
-def _run_ingestion(config_path: str) -> tuple[int, str]:
-    """Execute the existing ingestion service without enabling optional Spark."""
+def _run_ingestion(config_path: str, *, spark_batch: bool = False) -> tuple[int, str]:
+    """Execute the existing ingestion service; Spark runs only when explicitly requested."""
     path = Path(config_path)
     if not path.is_absolute():
         path = ROOT / path
@@ -529,31 +529,56 @@ def _render_events(data: Dict[str, Any]) -> None:
         st.info("No events match the selected filters.")
 
 
-def resolve_role(email: str, role_config: Dict[str, Any]) -> str:
-    """Resolve least-privilege workspace role from explicit email allowlists."""
+def resolve_role(email: str, role_config: Dict[str, Any]) -> Optional[str]:
+    """Resolve a workspace role from explicit email allowlists.
+
+    Returns None for emails on no list: signing in proves identity, not access.
+    """
     normalized = email.strip().lower()
     if not normalized:
-        return "viewer"
+        return None
     for role in ("admin", "analyst", "viewer"):
         values = role_config.get(f"{role}_emails", [])
         if isinstance(values, (list, tuple, set)) and normalized in {
             str(value).strip().lower() for value in values
         }:
             return role
-    return "viewer"
+    return None
 
 
-def _auth_configuration_available() -> bool:
+REQUIRED_AUTH_SETTINGS = (
+    "redirect_uri",
+    "cookie_secret",
+    "client_id",
+    "client_secret",
+    "server_metadata_url",
+)
+
+
+def missing_auth_settings(auth: Dict[str, Any]) -> List[str]:
+    """Names of required [auth] secrets that are absent or empty."""
+    return [name for name in REQUIRED_AUTH_SETTINGS if not auth.get(name)]
+
+
+def _missing_auth_configuration() -> List[str]:
     try:
-        auth = st.secrets.get("auth", {})
-        return bool(
-            auth.get("redirect_uri")
-            and auth.get("client_id")
-            and auth.get("client_secret")
-            and auth.get("server_metadata_url")
-        )
+        return missing_auth_settings(st.secrets.get("auth", {}))
     except Exception:
-        return False
+        return list(REQUIRED_AUTH_SETTINGS)
+
+
+def _render_access_denied(email: str) -> None:
+    st.markdown('<div class="cp-eyebrow">Secure workspace</div>', unsafe_allow_html=True)
+    st.title("Access not granted")
+    st.error(
+        f"{email or 'This account'} is signed in but is not on any CareerPulse role list."
+    )
+    st.markdown(
+        "Ask an administrator to add your email to `admin_emails`, `analyst_emails` "
+        "or `viewer_emails` in the `[roles]` section of `.streamlit/secrets.toml`."
+    )
+    if st.button("Log out", type="primary"):
+        st.logout()
 
 
 def _render_login_gate() -> bool:
@@ -585,13 +610,19 @@ def _render_login_gate() -> bool:
     with right:
         st.markdown('<div class="cp-card">', unsafe_allow_html=True)
         st.markdown("#### Sign in to CareerPulse")
-        if _auth_configuration_available():
+        missing = _missing_auth_configuration()
+        if not missing:
             st.write("Continue with your configured identity provider.")
             if st.button("Sign in securely", type="primary", use_container_width=True):
                 st.login()
         else:
             st.error("Authentication is not configured yet. The dashboard remains locked until OIDC is configured.")
-            st.markdown("Create `.streamlit/secrets.toml` from `docs/authentication-and-big-data.md`, add your identity-provider credentials, then restart Streamlit.")
+            st.markdown(
+                "Missing `[auth]` settings: "
+                + ", ".join(f"`{name}`" for name in missing)
+                + ". Create `.streamlit/secrets.toml` from `docs/authentication-and-big-data.md`, "
+                "add your identity-provider credentials, then restart Streamlit."
+            )
         st.markdown('</div>', unsafe_allow_html=True)
     return False
 
@@ -728,6 +759,9 @@ def render_dashboard() -> None:
     except Exception:
         role_config = {}
     role = resolve_role(email, role_config)
+    if role is None:
+        _render_access_denied(email)
+        return
     allowed_pages = ["Overview", "Job explorer", "Big Data operations", "Lifecycle events"]
     if role in {"admin", "analyst"}:
         allowed_pages.append("Pipeline control")
@@ -743,11 +777,14 @@ def render_dashboard() -> None:
         st.divider()
         page = st.radio("Workspace", allowed_pages, label_visibility="collapsed")
         st.divider()
-        database_path = st.text_input(
-            "SQLite database",
-            value=os.environ.get("CAREERPULSE_SQLITE_PATH", DEFAULT_DB),
-            help="Path to the SQLite database created by the ingestion service.",
-        )
+        database_path = os.environ.get("CAREERPULSE_SQLITE_PATH", DEFAULT_DB)
+        # Only administrators may point the workspace at a different file.
+        if role == "admin":
+            database_path = st.text_input(
+                "SQLite database",
+                value=database_path,
+                help="Path to the SQLite database created by the ingestion service.",
+            )
         st.caption("Public Greenhouse + Lever boards · OIDC access control")
         if st.button("Refresh workspace", use_container_width=True):
             st.rerun()
