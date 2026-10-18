@@ -1,13 +1,236 @@
+"""Parquet storage: a small date-partitioned event lake plus a one-file helper.
+
+Layout under the lake root::
+
+    events/event_date=YYYY-MM-DD/part-*.parquet       processed, change-detected events
+    quarantine/event_date=YYYY-MM-DD/part-*.parquet   records rejected by validation
+    window_counts/window_counts.parquet               streaming window aggregates
+    analytics/*.parquet                               Spark SQL / RDD / ML outputs
+
+Files are written to a hidden temporary name and atomically renamed, so readers
+such as the DuckDB dashboard never see a half-written file.
+"""
+
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 try:
     import pandas as pd
 except ImportError:  # pragma: no cover
     pd = None
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:  # pragma: no cover
+    pa = None
+    pq = None
+
+EVENTS_DATASET = "events"
+QUARANTINE_DATASET = "quarantine"
+WINDOW_DATASET = "window_counts"
+ANALYTICS_DATASET = "analytics"
+
+
+def _require_pyarrow() -> None:
+    if pa is None:
+        raise RuntimeError("Parquet lake storage requires pyarrow: pip install pyarrow")
+
+
+def _ts_type():
+    return pa.timestamp("us", tz="UTC")
+
+
+def events_schema():
+    _require_pyarrow()
+    return pa.schema([
+        ("event_id", pa.string()),
+        ("batch_id", pa.int64()),
+        ("job_id", pa.string()),
+        ("company", pa.string()),
+        ("title", pa.string()),
+        ("location", pa.string()),
+        ("experience", pa.string()),
+        ("salary", pa.float64()),
+        ("category", pa.string()),
+        ("source", pa.string()),
+        ("claimed_event", pa.string()),
+        ("event", pa.string()),
+        ("changed_fields", pa.string()),
+        ("fingerprint", pa.string()),
+        ("event_time", _ts_type()),
+        ("processed_at", _ts_type()),
+    ])
+
+
+def quarantine_schema():
+    _require_pyarrow()
+    return pa.schema([
+        ("batch_id", pa.int64()),
+        ("raw_value", pa.string()),
+        ("validation_error", pa.string()),
+        ("received_at", _ts_type()),
+    ])
+
+
+def window_schema():
+    _require_pyarrow()
+    return pa.schema([
+        ("window_start", _ts_type()),
+        ("window_end", _ts_type()),
+        ("event", pa.string()),
+        ("count", pa.int64()),
+    ])
+
+
+def to_utc_datetime(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _atomic_write_table(table, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    pq.write_table(table, temp)
+    os.replace(temp, target)
+    return target
+
+
+def _rows_for_schema(records: Iterable[Dict[str, Any]], schema) -> List[Dict[str, Any]]:
+    timestamp_fields = {field.name for field in schema if pa.types.is_timestamp(field.type)}
+    rows = []
+    for record in records:
+        row = {}
+        for field in schema:
+            value = record.get(field.name)
+            if field.name in timestamp_fields:
+                value = to_utc_datetime(value)
+            elif value is not None and pa.types.is_floating(field.type):
+                value = float(value)
+            elif value is not None and pa.types.is_integer(field.type):
+                value = int(value)
+            elif value is not None and pa.types.is_string(field.type):
+                value = str(value)
+            row[field.name] = value
+        rows.append(row)
+    return rows
+
+
+def append_partitioned(
+    records: Iterable[Dict[str, Any]],
+    lake_root: str | Path,
+    dataset: str,
+    schema,
+    *,
+    time_field: str,
+    label: str = "",
+) -> int:
+    """Append records as one Parquet file per ``event_date`` partition."""
+    _require_pyarrow()
+    rows = _rows_for_schema(records, schema)
+    if not rows:
+        return 0
+    by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        moment = row.get(time_field) or datetime.now(timezone.utc)
+        by_date.setdefault(moment.strftime("%Y-%m-%d"), []).append(row)
+
+    suffix = f"{label}-" if label else ""
+    for event_date, items in by_date.items():
+        table = pa.Table.from_pylist(items, schema=schema)
+        target = (
+            Path(lake_root) / dataset / f"event_date={event_date}"
+            / f"part-{suffix}{uuid.uuid4().hex[:12]}.parquet"
+        )
+        _atomic_write_table(table, target)
+    return len(rows)
+
+
+def append_events(records: Iterable[Dict[str, Any]], lake_root: str | Path, *, label: str = "") -> int:
+    return append_partitioned(
+        records, lake_root, EVENTS_DATASET, events_schema(), time_field="event_time", label=label
+    )
+
+
+def append_quarantine(records: Iterable[Dict[str, Any]], lake_root: str | Path, *, label: str = "") -> int:
+    return append_partitioned(
+        records, lake_root, QUARANTINE_DATASET, quarantine_schema(), time_field="received_at", label=label
+    )
+
+
+def merge_window_counts(records: Iterable[Dict[str, Any]], lake_root: str | Path) -> int:
+    """Upsert streaming window aggregates keyed by (window_start, window_end, event)."""
+    _require_pyarrow()
+    target = Path(lake_root) / WINDOW_DATASET / "window_counts.parquet"
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    if target.exists():
+        for row in pq.read_table(target).to_pylist():
+            merged[(row["window_start"], row["window_end"], row["event"])] = row
+    for row in _rows_for_schema(records, window_schema()):
+        merged[(row["window_start"], row["window_end"], row["event"])] = row
+    if not merged:
+        return 0
+    ordered = sorted(merged.values(), key=lambda row: (row["window_start"], row["event"]))
+    _atomic_write_table(pa.Table.from_pylist(ordered, schema=window_schema()), target)
+    return len(ordered)
+
+
+def write_analytics_table(records: List[Dict[str, Any]], lake_root: str | Path, name: str) -> Path:
+    """Replace one analytics output table (``<lake>/analytics/<name>.parquet``)."""
+    _require_pyarrow()
+    return _atomic_write_table(
+        pa.Table.from_pylist(records), Path(lake_root) / ANALYTICS_DATASET / f"{name}.parquet"
+    )
+
+
+def dataset_files(lake_root: str | Path, dataset: str) -> List[Path]:
+    root = Path(lake_root) / dataset
+    if not root.exists():
+        return []
+    return sorted(path for path in root.rglob("*.parquet") if not path.name.startswith("."))
+
+
+def read_dataset(lake_root: str | Path, dataset: str = EVENTS_DATASET):
+    """Read a lake dataset into pandas (empty frame with the schema if missing)."""
+    _require_pyarrow()
+    schemas = {
+        EVENTS_DATASET: events_schema(),
+        QUARANTINE_DATASET: quarantine_schema(),
+        WINDOW_DATASET: window_schema(),
+    }
+    files = dataset_files(lake_root, dataset)
+    if not files:
+        schema = schemas.get(dataset)
+        return schema.empty_table().to_pandas() if schema is not None else pd.DataFrame()
+    # Files are read one by one (not as a hive dataset) because every file
+    # already carries event_time; the event_date directory is for pruning only.
+    tables = [pq.read_table(path) for path in files]
+    return pa.concat_tables(tables, promote_options="default").to_pandas()
+
+
+def write_json(payload: Dict[str, Any], path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    temp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    os.replace(temp, target)
+    return target
 
 
 def write_parquet_records(records: Iterable[Dict[str, Any]], output_path: str) -> Path:

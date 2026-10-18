@@ -4,14 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.generator.job_generator import generate_batch
+from src.generator.job_generator import JobEventSimulator, generate_batch
 
 try:
     from kafka import KafkaProducer
@@ -29,7 +31,19 @@ class JsonSerializer(Serializer):
         # Supports kafka-python versions that pass (topic, data),
         # (topic, headers, data), or just data.
         value = args[-1]
+        if isinstance(value, str):
+            # Pre-serialized payloads (e.g. deliberately malformed demo
+            # records) are sent verbatim.
+            return value.encode("utf-8")
         return json.dumps(value, ensure_ascii=False).encode("utf-8")
+
+
+class KeySerializer(Serializer):
+    """Serialize message keys (job IDs) as UTF-8."""
+
+    def serialize(self, *args) -> bytes | None:
+        key = args[-1]
+        return None if key is None else str(key).encode("utf-8")
 
 
 class KafkaJobProducer:
@@ -66,10 +80,19 @@ class KafkaJobProducer:
         self._producer = KafkaProducer(
             bootstrap_servers=servers,
             value_serializer=JsonSerializer(),
+            key_serializer=KeySerializer(),
         )
 
-    def send_event(self, event: dict) -> None:
-        future = self._producer.send(self.topic, event)
+    @staticmethod
+    def message_key(event: Any) -> Optional[str]:
+        # Keying by job_id keeps every event of one posting on one partition,
+        # so consumers see that posting's lifecycle in order.
+        if isinstance(event, dict) and event.get("job_id") is not None:
+            return str(event["job_id"])
+        return None
+
+    def send_event(self, event: Any) -> None:
+        future = self._producer.send(self.topic, value=event, key=self.message_key(event))
         future.get(timeout=self.timeout_seconds)
 
     def send_batch(self, events: Iterable[dict]) -> None:
@@ -82,29 +105,82 @@ class KafkaJobProducer:
             self._producer.close(timeout=self.timeout_seconds)
 
 
+def stream_events(
+    producer: KafkaJobProducer,
+    simulator: JobEventSimulator,
+    *,
+    rate: float,
+    duration_seconds: Optional[float] = None,
+    max_events: Optional[int] = None,
+) -> int:
+    """Publish simulator events continuously at ``rate`` events per second."""
+    interval = 1.0 / rate
+    started = time.monotonic()
+    sent = 0
+    while (max_events is None or sent < max_events) and (
+        duration_seconds is None or time.monotonic() - started < duration_seconds
+    ):
+        producer.send_event(simulator.next_event())
+        sent += 1
+        if sent % 50 == 0:
+            print(f"Published {sent} events", flush=True)
+        delay = started + sent * interval - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+    return sent
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Publish generated job events to Kafka."
     )
     parser.add_argument("--bootstrap-servers", default="localhost:9092")
     parser.add_argument("--topic", default="job-events")
-    parser.add_argument("--count", type=int, default=25)
+    parser.add_argument("--count", type=int, default=None, help="Events to send (default 25), or an optional cap in --stream mode")
+    parser.add_argument("--stream", action="store_true", help="Send simulated lifecycle events continuously")
+    parser.add_argument("--rate", type=float, default=5.0, help="Events per second in --stream mode")
+    parser.add_argument("--duration", type=float, default=None, help="Stop --stream mode after N seconds")
+    parser.add_argument("--backfill-hours", type=float, default=0, help="Send --count simulated events spread over the past N hours")
+    parser.add_argument("--invalid-rate", type=float, default=0.0, help="Fraction of malformed records to include")
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    if args.count < 0:
+    if args.count is not None and args.count < 0:
         parser.error("--count must be non-negative")
+    batch_count = 25 if args.count is None else args.count
+    if args.rate <= 0:
+        parser.error("--rate must be positive")
 
     producer = KafkaJobProducer(
         bootstrap_servers=args.bootstrap_servers,
         topic=args.topic,
     )
+    simulator = JobEventSimulator(seed=args.seed, invalid_rate=args.invalid_rate)
 
     try:
-        events = generate_batch(count=args.count)
-        producer.send_batch(events)
-        print(
-            f"Kafka acknowledged {len(events)} events on '{args.topic}'"
-        )
+        if args.backfill_hours:
+            span = timedelta(hours=args.backfill_hours)
+            events = simulator.generate(batch_count, start=datetime.now(timezone.utc) - span, span=span)
+            producer.send_batch(events)
+            sent = len(events)
+            if args.stream:
+                sent += stream_events(producer, simulator, rate=args.rate, duration_seconds=args.duration)
+        elif args.stream:
+            sent = stream_events(
+                producer, simulator, rate=args.rate, duration_seconds=args.duration,
+                max_events=args.count,
+            )
+        elif args.invalid_rate:
+            events = simulator.generate(batch_count)
+            producer.send_batch(events)
+            sent = len(events)
+        else:
+            events = generate_batch(count=batch_count)
+            producer.send_batch(events)
+            sent = len(events)
+        print(f"Kafka acknowledged {sent} events on '{args.topic}'")
+    except KeyboardInterrupt:
+        print("Stopped publishing.")
     finally:
         producer.close()
 

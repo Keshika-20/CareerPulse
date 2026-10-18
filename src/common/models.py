@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -17,6 +20,47 @@ REQUIRED_FIELDS = {
 }
 
 VALID_EVENTS = {"NEW", "MODIFIED", "CLOSED", "DUPLICATE"}
+
+# Fields whose change makes a posting MODIFIED; timestamps and source metadata do not.
+TRACKED_FIELDS = ("company", "title", "location", "experience", "salary")
+
+# Ordered (category, pattern) rules applied to job titles. The first match wins, so
+# specific families (ML, data) are listed before the generic engineering rule. The
+# patterns are also compiled into Spark `rlike` expressions, so they must stay
+# compatible with both Python `re` and Java regular expressions.
+CATEGORY_RULES = (
+    ("AI / ML", r"\b(machine learning|ml|ai|deep learning|data scientist|nlp|computer vision)\b"),
+    ("Data", r"\b(data|analytics|analyst|bi|business intelligence|etl)\b"),
+    ("DevOps / Cloud", r"\b(devops|cloud|sre|site reliability|infrastructure|platform|kubernetes)\b"),
+    ("Security", r"\b(security|secops|appsec)\b"),
+    ("Quality", r"\b(qa|quality|test|tester|sdet)\b"),
+    ("Product", r"\b(product manager|product owner|program manager|project manager)\b"),
+    ("Design", r"\b(designer|design|ux|ui)\b"),
+    ("Engineering", r"\b(engineer|engineering|developer|software|backend|frontend|full[ -]?stack|mobile|android|ios)\b"),
+    ("Sales & Marketing", r"\b(sales|account executive|marketing|growth|business development)\b"),
+)
+DEFAULT_CATEGORY = "Other"
+_COMPILED_CATEGORY_RULES = tuple(
+    (category, re.compile(pattern, re.IGNORECASE)) for category, pattern in CATEGORY_RULES
+)
+
+
+def derive_category(title: Any) -> str:
+    """Map a free-text job title to a coarse hiring category."""
+    text = str(title or "")
+    for category, pattern in _COMPILED_CATEGORY_RULES:
+        if pattern.search(text):
+            return category
+    return DEFAULT_CATEGORY
+
+
+def job_fingerprint(record: Dict[str, Any]) -> str:
+    """Stable hash of the tracked job details, used to spot duplicate postings."""
+    values = {field: record.get(field) for field in TRACKED_FIELDS}
+    if values["salary"] is not None:
+        values["salary"] = float(values["salary"])
+    encoded = json.dumps(values, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
 
 
 @dataclass

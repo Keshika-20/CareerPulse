@@ -121,3 +121,44 @@ def test_missing_auth_settings_includes_cookie_secret():
     assert missing_auth_settings(complete) == []
     assert missing_auth_settings({**complete, "cookie_secret": ""}) == ["cookie_secret"]
     assert missing_auth_settings({}) == list(REQUIRED_AUTH_SETTINGS)
+
+
+def test_streaming_view_renders_lake_and_hbase(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from streamlit.testing.v1 import AppTest
+
+    from src.generator.job_generator import JobEventSimulator
+    from src.storage.hbase_store import HBaseJobStore
+    from src.streaming.pipeline import StreamPipeline
+
+    hbase_path = tmp_path / "hbase.sqlite3"
+    store = HBaseJobStore.connect("local", path=hbase_path)
+    events = JobEventSimulator(seed=3, invalid_rate=0.05).generate(
+        200, start=datetime(2026, 10, 6, tzinfo=timezone.utc), span=timedelta(hours=3)
+    )
+    StreamPipeline(store, tmp_path / "lake").process_raw_records(events, batch_id=0)
+    job_id = next(iter(store.list_jobs()))
+    store.close()
+    monkeypatch.setenv("CAREERPULSE_HBASE_PATH", str(hbase_path))
+    monkeypatch.setenv("CP_TEST_LAKE", str(tmp_path / "lake"))
+
+    def page():
+        import os
+        from pathlib import Path
+
+        import streamlit as st
+
+        from src.dashboard.streaming_view import render_streaming_analytics
+
+        render_streaming_analytics(st, Path.cwd(), os.environ["CP_TEST_LAKE"])
+
+    app = AppTest.from_function(page, default_timeout=60).run()
+    assert not app.exception
+    labels = [metric.label for metric in app.metric]
+    assert "New jobs · last 5 min" in labels and "Rejected by validation" in labels
+    assert any("Run `python -m src.analytics.run_analytics`" in info.value for info in app.info)
+
+    app.text_input(key="cp_hbase_job").input(job_id).run()
+    assert not app.exception
+    assert app.json  # current HBase state is rendered

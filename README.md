@@ -1,237 +1,132 @@
 # CareerPulse
 
-CareerPulse is a local job-market ingestion and lifecycle analytics project. It can fetch configured public Greenhouse and Lever company boards, normalize their postings, track changes across runs in SQLite, and display persisted or synthetic data in Streamlit.
+**Real-Time Job Posting Change & Hiring Trend Analytics**
 
-## Current Implementation Status
+CareerPulse watches a stream of job-posting events and works out how hiring is changing. Each event is classified as new, modified, duplicate or closed by comparing it with the job's stored state. The pipeline keeps every job's history and produces hiring-trend analytics, a top-k trending-company ranking and a demand forecast.
 
-- Greenhouse and Lever public company-board adapters are implemented. They use bounded HTTP timeouts and retries, and source responses are validated before a scan is treated as complete.
-- Listings are normalized to stable source/account/job IDs. Salary and experience may be unknown (`null`); provider salary ranges remain bounds and are not converted into an invented scalar salary.
-- SQLite is the durable snapshot and lifecycle store. An absent listing is closed only after two consecutive complete successful scans for its source account.
-- Spark is an explicit optional batch aggregation path (`--spark-batch`) over lifecycle events. It is not a streaming source or sink.
-- The dashboard labels synthetic demo data separately from persisted ingestion data.
+Stack: Python · Apache Kafka · PySpark Structured Streaming · HBase · Parquet · DuckDB · Spark SQL · Spark RDD · Spark MLlib · Streamlit
 
-Kafka consumer integration, PySpark Structured Streaming, HBase persistence, ingestion-to-Parquet output, Spark SQL/RDD analytics, and machine-learning predictions are not implemented. The Kafka producer, in-memory HBase-shaped example, and Parquet helper are separate demonstrations and are not wired into the public-source ingestion path.
-
-The historical architecture sections below describe a target design, not the current runtime pipeline.
-
-## Current dashboard workspace
-
-The Streamlit dashboard includes four views:
-
-- **Overview:** active listings, represented companies and sources, lifecycle totals, company distribution, and recent changes.
-- **Job explorer:** search and filter active jobs by title/company/location/source, inspect listing details, open the original provider posting, and export filtered results as CSV.
-- **Pipeline control:** view the ingestion stages, launch the existing ingestion service from the UI, and inspect latest source-account scans and run history.
-- **Lifecycle events:** filter the recent persisted NEW/MODIFIED/CLOSED audit trail and export it as CSV.
-
-The dashboard reads the configured SQLite database in read-only mode. Use the sidebar's database field or `CAREERPULSE_SQLITE_PATH` to select the database. The pipeline control view runs the ordinary Python ingestion command; it does not silently enable Spark. Only configured and enabled public source accounts are fetched. If only one Greenhouse account is enabled, the dashboard will only contain that account's postings; add additional verified Greenhouse board tokens and/or Lever site identifiers to your local ingestion configuration to expand coverage.
-
-## 1. Project Goal
-The implemented workflow fetches public listings for configured company boards and tracks cross-run changes. A separate synthetic generator remains available for local demonstrations. The current ingestion workflow is batch-oriented, not real time. It can record:
-
-- new postings
-- modified postings
-- closed postings
-- duplicate postings
-- hiring trend changes over time
-
-## 2. Target High-Level Architecture (Not Implemented)
+## Architecture
 
 ```text
-Python Job Event Generator
-        ↓
-Apache Kafka
-        ↓
-PySpark Structured Streaming
-        ↓
-Validation + Cleaning + Change Detection + Aggregation
-        ↓
-    ┌───────────────┬───────────────┐
-    │               │               │
-    ▼               ▼               ▼
-HBase            Parquet        DuckDB / Analytics Layer
-    │               │               │
-    └───────────────┴───────────────┘
-        ↓
-Spark SQL + Spark RDD + Simple ML
-        ↓
-Streamlit Dashboard
+Python job-event simulator ──┐
+Public board ingestion       ├──► Kafka topic job-events (keyed by job_id)
+  (Greenhouse / Lever --kafka)┘            │
+                                           ▼
+                     PySpark Structured Streaming
+        parse JSON → validate → clean → enrich (category) → watermark
+                 │                                     │
+   foreachBatch: change detection vs HBase      sliding event-time windows
+                 │                                     │
+      ┌──────────┴───────────┐                         │
+      ▼                      ▼                         ▼
+  HBase job_history     Parquet lake: events / quarantine / window_counts
+  + company_stats                │
+                                 ▼
+          Spark SQL trends · Spark RDD top-k · MLlib demand forecast
+                                 │  (analytics/*.parquet)
+                                 ▼
+                  DuckDB queries ──► Streamlit dashboard
 ```
 
-## 3. Pipeline Flow
+See [docs/architecture.md](./docs/architecture.md) for the data model and design decisions.
 
-1. Data Generation
-   - Python generates semi-structured JSON job events.
-   - Each record includes job metadata, timestamp, and event type.
+## What is implemented
 
-2. Streaming Layer
-   - Kafka acts as the ingestion transport.
-   - Producer pushes streaming events continuously.
+| Requirement | Implementation |
+|---|---|
+| Semi-structured data | JSON job events ([src/generator/job_generator.py](./src/generator/job_generator.py)); a stateful simulator produces realistic lifecycles and optional malformed records |
+| Streaming data | Kafka producer keyed by `job_id` ([src/streaming/kafka_producer.py](./src/streaming/kafka_producer.py)) → Structured Streaming ([src/streaming/spark_kafka_consumer.py](./src/streaming/spark_kafka_consumer.py)) |
+| ETL and validation | Spark-native schema, missing-value, type, event and timestamp checks; whitespace cleaning; title → category enrichment. Rejected records go to a Parquet quarantine with an error code |
+| Change detection | Each event is compared with the job's HBase state to give NEW / MODIFIED (with changed fields) / CLOSED / DUPLICATE ([src/streaming/change_detection.py](./src/streaming/change_detection.py)) |
+| HBase | `job_history` stores versioned `info` cells and a wide `events:<epoch_ms>#<seq>` history row; `company_stats` holds atomic counters ([src/storage/hbase_store.py](./src/storage/hbase_store.py)) |
+| Parquet | Date-partitioned event lake, quarantine and window aggregates, written atomically ([src/storage/parquet_store.py](./src/storage/parquet_store.py)) |
+| Time-series / streaming windows | Watermarked sliding windows (5 min every 1 min) over event time; timestamped HBase cell versions |
+| Spark SQL | Hiring trends by company, location and category; average salary by category; new jobs in the last N minutes; modified and closed counts ([src/analytics/spark_analytics.py](./src/analytics/spark_analytics.py)) |
+| Spark RDD | Top-k companies and top-k *trending* companies via map → filter → reduceByKey → takeOrdered |
+| ML | Spark MLlib linear regression forecasting next-bucket NEW postings per category from lag features, compared against a naive baseline ([src/analytics/demand_model.py](./src/analytics/demand_model.py)) |
+| DuckDB | Dashboard query layer over the Parquet lake ([src/analytics/duckdb_queries.py](./src/analytics/duckdb_queries.py)) |
+| Dashboard | Streamlit **Streaming analytics** page: live feed, KPIs, windows, trends, quarantine, Spark outputs, HBase job lookup |
 
-3. Ingestion and Validation
-   - PySpark Structured Streaming reads Kafka topics.
-   - Records are validated for schema, null values, duplicates, and malformed fields.
+Real public job boards (Greenhouse, Lever) can be ingested into SQLite and published into the same Kafka topic. See [docs/ingestion.md](./docs/ingestion.md).
 
-4. Change Detection
-   - Job records are compared against prior state to detect:
-     - NEW
-     - MODIFIED
-     - CLOSED
-     - DUPLICATE
+## Quick start
 
-5. Storage Layer
-   - HBase stores operational job history and state.
-   - Parquet stores historical/raw event data for analytical querying.
+### Local run (no Kafka or Docker)
 
-6. Analytics Layer
-   - Spark SQL performs trend aggregation over company, location, category, and salary.
-   - Spark RDD performs top-k and trending-company analysis.
-   - A simple ML model predicts demand or relevance from selected job attributes.
+This uses the same ETL, change detection, HBase (embedded emulator) and Parquet code as the streaming job, fed in micro-batches from the simulator:
 
-7. Visualization Layer
-   - Streamlit renders real-time metrics, event feed, analytics, and model outcomes.
+```powershell
+pip install -r requirements.txt
+python scripts/run_pipeline.py --count 3000 --backfill-hours 24 --reset --spark
+```
 
-## 4. Core Components
+### Full streaming pipeline (Docker)
 
-### 4.1 Job Event Generator
-- Produces realistic semistructured job data in JSON.
-- Includes fields such as job_id, company, title, location, experience, salary, timestamp, and event.
-- Simulates event types such as NEW, MODIFIED, CLOSED, DUPLICATE.
+```powershell
+docker compose --profile pipeline up -d --build        # Kafka + HBase + Spark streaming job
+python -m src.streaming.kafka_producer --backfill-hours 24 --count 3000 --stream --rate 5 --invalid-rate 0.03
+docker compose --profile analytics run --rm spark-analytics   # Spark SQL + RDD + MLlib
+```
 
-### 4.2 Kafka Producer/Consumer Layer
-- Carries events from generator to Spark.
-- Provides decoupling between event production and processing.
-- Enables continuous data arrival and scaling to streaming workloads.
+### Dashboard
 
-### 4.3 PySpark Structured Streaming
-- Reads and processes Kafka streams.
-- Performs ETL operations: filtering, cleansing, transformation, and enrichment.
-- Builds real-time derived datasets for trend detection.
+```powershell
+$env:CAREERPULSE_HBASE_MODE = "thrift"   # when the Docker HBase is running; omit for the local emulator
+python -m streamlit run .\src\dashboard\app.py
+```
 
-### 4.4 Validation and Change Detection
-- Schema validation
-- Missing-value checks
-- Duplicate detection
-- State comparison against previous job snapshots
-- Event classification and archival
+The dashboard requires OIDC sign-in. See [docs/authentication-and-big-data.md](./docs/authentication-and-big-data.md).
 
-### 4.5 Storage Architecture
-- HBase: row-based operational history for incremental updates and current state.
-- Parquet: columnar storage for historical analytics and long-term data retention.
+Full instructions, including running Spark natively and on Windows, are in [docs/runbook.md](./docs/runbook.md).
 
-### 4.6 Analytics Engine
-- Spark SQL for hiring trends by company, location, category, and time window.
-- Spark RDD for top-k and trending-company calculations.
-- ML model for demand/relevance forecasting.
-
-### 4.7 Dashboard
-- Live event stream
-- New/modified/closed job counts
-- Trend charts
-- Top companies
-- Salary analytics
-- Model predictions
-
-## 5. Example Event Schema
+## Example event
 
 ```json
-{
-  "job_id": "J1024",
-  "company": "Google",
-  "title": "Software Engineer",
-  "location": "Bangalore",
-  "experience": "0-2 years",
-  "salary": 1200000,
-  "timestamp": "2026-10-06T16:30:00Z",
-  "event": "NEW"
-}
+{"job_id": "J1024", "company": "Google", "title": "Software Engineer", "location": "Bangalore",
+ "experience": "0-2 years", "salary": 1200000, "timestamp": "2026-10-06T16:30:00Z", "event": "NEW"}
 ```
 
-## 6. Major Analytics Supported
-- New jobs received in the last 5 minutes
-- Top companies by new postings
-- Hiring trends by company, location, and category
-- Average salary by category
-- Modified and closed posting counts
-- Top-k trending companies using Spark RDD
-- Predicted job demand/relevance using a simple ML model
+## Dashboard workspace
 
-## 7. Target Technology Mapping (Not Implemented)
+- **Overview:** active listings from public-board ingestion, lifecycle totals, company distribution, recent changes.
+- **Streaming analytics:** new jobs in the last 5 minutes, modified, closed, duplicate and rejected counts, a live event feed, streaming windows, trends by company, location and category, average salary by category, the validation quarantine, the Spark RDD top-k and trending companies, the MLlib demand forecast with error metrics, and an HBase job-history lookup.
+- **Job explorer:** search, filter and export active ingested jobs.
+- **Big Data operations:** pipeline stage overview, storage inventory, and ingestion and Spark batch controls (admin).
+- **Pipeline control** (admin/analyst): run ingestion and inspect per-account scans.
+- **Lifecycle events:** filterable audit trail of ingested NEW, MODIFIED and CLOSED events.
 
-| Layer | Technology | Responsibility |
-|---|---|---|
-| Event generation | Python | Simulate job-posting events |
-| Streaming | Apache Kafka | Event transport and buffering |
-| Processing | PySpark Structured Streaming | Stream ETL and validation |
-| Operational storage | HBase | Current and historical job-state storage |
-| Historical storage | Parquet | Raw and aggregated analytics data |
-| Analytics | Spark SQL + RDD | Trend and ranking calculations |
-| Prediction | Simple ML | Demand or relevance prediction |
-| Dashboard | Streamlit | Real-time reporting |
-| Optional analytics query engine | DuckDB | Local analytical exploration |
-
-## 8. Recommended Folder Structure
+## Repository layout
 
 ```text
-CareerPulse/
-├── README.md
-├── docs/
-│   └── architecture.md
-├── config/
-│   ├── kafka_config.yaml
-│   └── spark_config.yaml
-├── data/
-│   ├── raw/
-│   └── processed/
-├── src/
-│   ├── generator/
-│   ├── streaming/
-│   ├── analytics/
-│   └── dashboard/
-├── scripts/
-│   ├── start_kafka.sh
-│   ├── start_spark.sh
-│   └── run_dashboard.sh
-├── tests/
-│   ├── test_generator.py
-│   ├── test_streaming.py
-│   └── test_analytics.py
-└── requirements.txt
+src/
+  generator/job_generator.py      job events + stateful lifecycle simulator
+  streaming/kafka_producer.py     Kafka producer (batch, backfill, continuous)
+  streaming/spark_kafka_consumer.py  Structured Streaming job
+  streaming/etl.py                record-level clean/validate/enrich rules
+  streaming/change_detection.py   NEW / MODIFIED / CLOSED / DUPLICATE detection
+  streaming/pipeline.py           micro-batch: detection -> HBase -> Parquet
+  storage/hbase_store.py          HBase model (happybase or embedded emulator)
+  storage/parquet_store.py        Parquet lake
+  analytics/spark_analytics.py    Spark SQL + RDD analytics
+  analytics/demand_model.py       Spark MLlib demand forecast
+  analytics/run_analytics.py      batch analytics CLI
+  analytics/duckdb_queries.py     DuckDB queries for the dashboard
+  ingestion/                      Greenhouse / Lever ingestion into SQLite
+  dashboard/                      Streamlit app
+scripts/run_pipeline.py           local end-to-end run
+docker/spark/                     Linux Spark image
+compose.yaml                      Kafka, HBase, Spark streaming and analytics
 ```
 
-## 9. Implementation Phases
+## Tests
 
-### Phase 1: Foundations
-- Set up Python project environment
-- Create event generator
-- Define JSON schema
+```powershell
+python -m pytest -q
+```
 
-### Phase 2: Streaming Layer
-- Configure Kafka producer and consumer
-- Validate streaming ingestion
+The Spark tests run on in-memory DataFrames, so they need Java and PySpark but no Kafka broker or Hadoop winutils.
 
-### Phase 3: Spark Processing
-- Build Structured Streaming jobs
-- Implement validation, deduplication, and change detection
+## Scope
 
-### Phase 4: Storage
-- Connect to HBase for operational data
-- Write and query Parquet for analytical history
-
-### Phase 5: Analytics and ML
-- Build Spark SQL aggregations
-- Implement RDD transformations
-- Train simple demand/relevance model
-
-### Phase 6: Dashboard
-- Visualize live feeds and trend metrics
-- Present ML predictions and company insights
-
-## 10. Non-Functional Focus
-- Real-time processing of continuous events
-- Fault-tolerant streaming pipeline
-- Data consistency across HBase and Parquet
-- Maintainable modular code structure
-- Clear separation between ingestion, processing, storage, analytics, and UI
-
-## 11. Summary
-This is a summary of the aspirational target design above, not a statement about current implementation. For the actual ingestion and runtime workflow, see [the ingestion guide](./docs/ingestion.md) and [the runbook](./docs/runbook.md).
+This is the medium-scope version: simulated events plus optional public company boards. There is no large-scale crawler, microservice architecture, MinHash/LSH deduplication or deep-learning model.
