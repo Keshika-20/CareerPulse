@@ -74,8 +74,9 @@ def test_job_lifecycle_state_history_and_counters():
     assert state["first_seen"] == "2026-10-06T10:00:00+00:00"
 
     history = store.get_history("J1")
-    assert [item["event"] for item in history] == ["NEW", "MODIFIED", "CLOSED"]
+    assert [item["event"] for item in history] == ["NEW", "MODIFIED", "DUPLICATE", "CLOSED"]
     assert history[1]["changed_fields"] == "salary"
+    assert [item["event"] for item in store.get_history("J1", include_duplicates=False)] == ["NEW", "MODIFIED", "CLOSED"]
 
     salaries = [item["value"] for item in store.field_versions("J1", "salary")]
     assert salaries[:2] == [1800000.0, 1500000.0]
@@ -121,3 +122,50 @@ def test_put_job_keeps_legacy_interface():
 def test_unknown_mode_is_rejected():
     with pytest.raises(ValueError):
         HBaseJobStore.connect("cassandra")
+
+
+INCREMENT_SCRIPT = """
+import sys
+from src.storage.hbase_store import HBaseJobStore
+store = HBaseJobStore.connect("local", path=sys.argv[1])
+for _ in range(int(sys.argv[2])):
+    store.stats.counter_inc("Google", "stats:NEW")
+store.close()
+"""
+
+
+def test_counter_increments_are_atomic_across_processes(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    path = tmp_path / "hbase.sqlite3"
+    HBaseJobStore.connect("local", path=path).close()
+    root = Path(__file__).resolve().parents[1]
+    # Independent OS processes hammer the same counter concurrently.
+    workers = [
+        subprocess.Popen([sys.executable, "-c", INCREMENT_SCRIPT, str(path), "150"], cwd=root)
+        for _ in range(4)
+    ]
+    assert [worker.wait(timeout=120) for worker in workers] == [0, 0, 0, 0]
+
+    store = HBaseJobStore.connect("local", path=path)
+    assert store.stats.counter_get("Google", "stats:NEW") == 600  # no lost updates
+    store.close()
+
+
+def test_batched_writes_match_single_writes():
+    single, batched = HBaseJobStore(), HBaseJobStore()
+    events = [
+        (_event("NEW", "2026-10-06T10:00:00+00:00", event_id="a"), None),
+    ]
+    single.apply_event(*events[0])
+    modified = _event("MODIFIED", "2026-10-06T11:00:00+00:00", salary=1.0, changed_fields="salary", event_id="b")
+    single.apply_event(modified, single.get_job("J1"))
+
+    first_state = HBaseJobStore.next_state(events[0][0], None)
+    batched.apply_events([events[0], (modified, first_state)])
+
+    assert single.get_job("J1") == batched.get_job("J1")
+    assert single.get_history("J1") == batched.get_history("J1")
+    assert single.company_stats() == batched.company_stats()

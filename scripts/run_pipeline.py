@@ -60,7 +60,7 @@ def main() -> None:
         args.hbase_mode, host=args.hbase_host, port=args.hbase_port, path=args.hbase_path
     )
     pipeline = StreamPipeline(store, lake, source="local-runner")
-    last_batch = pipeline.load_status().get("batch_id")
+    last_batch = pipeline.load_status().get("last_batch_by_source", {}).get(pipeline.source)
     first_batch = int(last_batch) + 1 if last_batch is not None else 0
     try:
         for offset in range(0, len(events), args.batch_size):

@@ -1,7 +1,7 @@
 """Run the CareerPulse batch analytics over the Parquet event lake.
 
-Spark SQL hiring trends, Spark RDD top-k / trending companies and the MLlib
-demand forecast. Outputs land in ``<lake>/analytics`` for the dashboard.
+Spark SQL hiring trends, Spark RDD top-k / trending companies, the MLlib
+demand forecast and MinHash LSH near-duplicate postings. Outputs land in ``<lake>/analytics`` for the dashboard.
 
     python -m src.analytics.run_analytics --lake data/lake --bucket-minutes 60
 """
@@ -50,6 +50,8 @@ def run_all(
     trend_window_minutes: int = 60,
     bucket_minutes: int = 60,
     with_ml: bool = True,
+    with_near_duplicates: bool = True,
+    near_duplicate_similarity: float = 0.85,
 ) -> Dict[str, Any]:
     events = spark_analytics.load_events(spark, lake_root).cache()
     total_events = events.count()
@@ -69,6 +71,13 @@ def run_all(
         model_result = forecast_demand(events, bucket_minutes=bucket_minutes)
         outputs["demand_predictions"] = model_result.get("predictions", [])
 
+    near_duplicates: Optional[Dict[str, Any]] = None
+    if with_near_duplicates:
+        from src.analytics.near_duplicates import find_near_duplicates
+
+        near_duplicates = find_near_duplicates(events, min_similarity=near_duplicate_similarity)
+        outputs["near_duplicate_postings"] = near_duplicates["pairs"]
+
     for name, records in outputs.items():
         parquet_store.write_analytics_table(records, lake_root, name)
 
@@ -79,6 +88,7 @@ def run_all(
         "trend_window_minutes": trend_window_minutes,
         "tables": {name: len(records) for name, records in outputs.items()},
         "demand_model": {k: v for k, v in (model_result or {}).items() if k != "predictions"},
+        "near_duplicates": (near_duplicates or {}).get("summary", {}),
     }
     parquet_store.write_json(summary, Path(lake_root) / parquet_store.ANALYTICS_DATASET / "summary.json")
     events.unpersist()
@@ -94,6 +104,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--trend-window-minutes", type=int, default=60)
     parser.add_argument("--bucket-minutes", type=int, default=60, help="Time bucket for the demand model")
     parser.add_argument("--skip-ml", action="store_true")
+    parser.add_argument("--skip-near-duplicates", action="store_true")
+    parser.add_argument("--near-duplicate-similarity", type=float, default=0.85,
+                        help="Minimum Jaccard similarity for two open postings to be reported as near-duplicates")
     args = parser.parse_args(argv)
 
     spark = build_spark_session("CareerPulse Analytics", args.master)
@@ -106,6 +119,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             trend_window_minutes=args.trend_window_minutes,
             bucket_minutes=args.bucket_minutes,
             with_ml=not args.skip_ml,
+            with_near_duplicates=not args.skip_near_duplicates,
+            near_duplicate_similarity=args.near_duplicate_similarity,
         )
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)

@@ -11,10 +11,13 @@ incoming event types into the lake's ``window_counts`` dataset.
 from __future__ import annotations
 
 import argparse
+import functools
+import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, Iterable, Iterator, List
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -64,6 +67,11 @@ EVENT_SCHEMA = StructType(
 )
 
 ISO_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"
+# Version of the window aggregation's state schema (v2 adds HLL distinct counts).
+WINDOW_STATE_VERSION = 2
+
+# Relative standard deviation of the HyperLogLog++ distinct counts per window.
+DISTINCT_RSD = 0.02
 
 
 def parse_kafka_values(kafka_rows: DataFrame) -> DataFrame:
@@ -72,6 +80,7 @@ def parse_kafka_values(kafka_rows: DataFrame) -> DataFrame:
         kafka_rows
         .select(
             F.col("value").cast("string").alias("raw_value"),
+            F.col("topic").alias("kafka_topic"),
             F.col("partition").alias("kafka_partition"),
             F.col("offset").alias("kafka_offset"),
         )
@@ -147,20 +156,47 @@ def apply_etl(parsed: DataFrame) -> DataFrame:
     )
 
 
-def window_counts(valid_events: DataFrame, *, watermark: str, window: str, slide: str) -> DataFrame:
-    """Sliding event-time window counts per incoming event type."""
+def window_counts(
+    valid_events: DataFrame,
+    *,
+    watermark: str,
+    window: str,
+    slide: str,
+    distinct_rsd: float = DISTINCT_RSD,
+) -> DataFrame:
+    """Sliding event-time window counts per incoming event type.
+
+    Besides the event count, each window carries the number of distinct jobs
+    and companies. Exact ``countDistinct`` is not supported in streaming
+    aggregations, so these use HyperLogLog++ (``approx_count_distinct``):
+    fixed-size state per window with a relative standard deviation of
+    ``distinct_rsd``.
+    """
     return (
         valid_events
         .withWatermark("event_time", watermark)
         .groupBy(F.window("event_time", window, slide), F.col("event"))
-        .count()
+        .agg(
+            F.count(F.lit(1)).alias("count"),
+            F.approx_count_distinct("job_id", distinct_rsd).alias("unique_jobs"),
+            F.approx_count_distinct("company", distinct_rsd).alias("unique_companies"),
+        )
         .select(
             F.date_format("window.start", ISO_FORMAT).alias("window_start"),
             F.date_format("window.end", ISO_FORMAT).alias("window_end"),
             "event",
             "count",
+            "unique_jobs",
+            "unique_companies",
         )
     )
+
+
+BATCH_COLUMNS = (
+    "raw_value", "validation_error", "job_id", "company", "title", "location",
+    "experience", "salary", "source", "timestamp", "event", "event_time_iso",
+    "category", "event_time", "kafka_topic", "kafka_partition", "kafka_offset",
+)
 
 
 def row_to_record(row: Any) -> Dict[str, Any]:
@@ -177,54 +213,140 @@ def row_to_record(row: Any) -> Dict[str, Any]:
         "event": row["event"],
         "event_time": event_time.isoformat() if event_time else None,
         "category": row["category"],
+        # The Kafka position gives every event a replay-stable identity.
+        "kafka_topic": row["kafka_topic"],
+        "kafka_partition": row["kafka_partition"],
+        "kafka_offset": row["kafka_offset"],
     }
     record["fingerprint"] = job_fingerprint(record)
     return record
 
 
-def make_batch_processor(pipeline_factory: Callable[[], StreamPipeline]) -> Callable[[DataFrame, int], None]:
-    """Build the foreachBatch handler that runs change detection and storage."""
-    state: Dict[str, Any] = {"pipeline": None}
+# One HBase connection per Python worker process, reused across tasks and
+# micro-batches (Spark reuses Python workers), instead of one per partition.
+_STORE_CACHE: Dict[str, HBaseJobStore] = {}
+
+
+def _store_key(hbase: Dict[str, Any]) -> str:
+    return json.dumps(hbase, sort_keys=True, default=str)
+
+
+def _cached_store(hbase: Dict[str, Any]) -> HBaseJobStore:
+    key = _store_key(hbase)
+    if key not in _STORE_CACHE:
+        _STORE_CACHE[key] = HBaseJobStore.connect(**hbase)
+    return _STORE_CACHE[key]
+
+
+def _drop_cached_store(hbase: Dict[str, Any]) -> None:
+    store = _STORE_CACHE.pop(_store_key(hbase), None)
+    if store is not None:
+        store.close()
+
+
+def process_partition_rows(
+    index: int,
+    rows: Iterable[Any],
+    *,
+    batch_id: int,
+    hbase: Dict[str, Any],
+    lake_root: str,
+    source: str,
+) -> Iterator[Dict[str, Any]]:
+    """Executor-side work for one partition of a micro-batch.
+
+    The batch is hash-partitioned by job_id, so this task is the only writer
+    for every job it sees and can safely read-then-write those HBase rows.
+    """
+    received_at = datetime.now(timezone.utc).isoformat()
+    valid: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    for row in rows:
+        if row["validation_error"] is None:
+            valid.append(row_to_record(row))
+        else:
+            rejected.append({
+                "raw_value": row["raw_value"],
+                "validation_error": row["validation_error"],
+                "received_at": received_at,
+            })
+    if not valid and not rejected:
+        return
+    for attempt in range(2):
+        try:
+            pipeline = StreamPipeline(_cached_store(hbase), lake_root, source=source)
+            summary = pipeline.process_partition(valid, batch_id, rejected=rejected, partition=index)
+        except Exception:
+            # An idle Thrift connection may have been dropped. Retrying is safe
+            # because every write in process_partition is idempotent.
+            _drop_cached_store(hbase)
+            if attempt:
+                raise
+            continue
+        yield summary
+        return
+
+
+def stream_label(checkpoint_dir: Path) -> str:
+    """Stable label for this streaming query, taken from its checkpoint metadata.
+
+    Spark batch IDs restart at 0 with a new checkpoint; prefixing output files
+    with the query ID keeps a new query from overwriting an old query's files,
+    while a restarted query (same checkpoint) keeps overwriting its own.
+    """
+    try:
+        query_id = json.loads((checkpoint_dir / "metadata").read_text(encoding="utf-8"))["id"]
+        return f"spark-{query_id[:8]}"
+    except (OSError, ValueError, KeyError):
+        return "spark"
+
+
+def make_batch_processor(
+    *,
+    hbase: Dict[str, Any],
+    lake_root: str | Path,
+    num_partitions: int,
+    source: str | Callable[[], str] = "spark",
+) -> Callable[[DataFrame, int], None]:
+    """Build the foreachBatch handler.
+
+    The micro-batch is repartitioned by job_id and each partition is processed
+    on an executor in parallel (change detection, HBase writes, Parquet file).
+    Only small per-partition summaries return to the driver.
+    """
+    resolved: Dict[str, str] = {}
 
     def process(batch_df: DataFrame, batch_id: int) -> None:
-        rows = (
-            batch_df
-            .select(
-                "raw_value", "validation_error", "job_id", "company", "title", "location",
-                "experience", "salary", "source", "timestamp", "event", "event_time_iso",
-                "category", "event_time", "kafka_partition", "kafka_offset",
-            )
-            .orderBy("event_time", "kafka_partition", "kafka_offset")
+        started = time.perf_counter()
+        if "source" not in resolved:
+            resolved["source"] = source() if callable(source) else source
+            # Create the HBase tables once on the driver so executors never race
+            # to create them on their first batch.
+            HBaseJobStore.connect(**hbase).close()
+        run = functools.partial(
+            process_partition_rows,
+            batch_id=int(batch_id),
+            hbase=hbase,
+            lake_root=str(lake_root),
+            source=resolved["source"],
+        )
+        summaries = (
+            batch_df.select(*BATCH_COLUMNS)
+            .repartition(num_partitions, "job_id")
+            .sortWithinPartitions("job_id", "event_time", "kafka_partition", "kafka_offset")
+            .rdd.mapPartitionsWithIndex(run)
             .collect()
         )
-        if not rows:
+        if not summaries:
             return
-        received_at = datetime.now(timezone.utc).isoformat()
-        valid: List[Dict[str, Any]] = []
-        rejected: List[Dict[str, Any]] = []
-        for row in rows:
-            if row["validation_error"] is None:
-                valid.append(row_to_record(row))
-            else:
-                rejected.append({
-                    "raw_value": row["raw_value"],
-                    "validation_error": row["validation_error"],
-                    "received_at": received_at,
-                })
-
-        if state["pipeline"] is None:
-            state["pipeline"] = pipeline_factory()
-        try:
-            summary = state["pipeline"].process_valid_records(valid, int(batch_id), rejected=rejected)
-        except Exception as exc:
-            # Thrift connections to HBase can drop while idle; reconnect once.
-            print(f"Batch {batch_id}: storage error ({exc}); reconnecting and retrying.", flush=True)
-            state["pipeline"].store.close()
-            state["pipeline"] = pipeline_factory()
-            summary = state["pipeline"].process_valid_records(valid, int(batch_id), rejected=rejected)
+        summary = StreamPipeline(None, lake_root, source=resolved["source"]).record_batch(
+            summaries, int(batch_id), duration_ms=round((time.perf_counter() - started) * 1000)
+        )
+        replay = " (replay)" if summary["replay"] else ""
         print(
             f"Batch {batch_id}: processed={summary['processed']} rejected={summary['rejected']} "
-            f"detected={summary['detected']}",
+            f"partitions={summary['partitions']} duration_ms={summary['duration_ms']} "
+            f"detected={summary['detected']}{replay}",
             flush=True,
         )
 
@@ -253,6 +375,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trigger-seconds", type=int, default=10, help="Micro-batch interval.")
     parser.add_argument("--available-now", action="store_true", help="Process everything available, then stop.")
     parser.add_argument("--max-offsets-per-trigger", type=int, default=5000)
+    parser.add_argument("--partitions", type=int, default=None, help="Parallel partitions per micro-batch (default: Spark default parallelism).")
     parser.add_argument("--watermark", default="10 minutes")
     parser.add_argument("--window", default="5 minutes")
     parser.add_argument("--slide", default="1 minute")
@@ -270,15 +393,13 @@ def main(argv: List[str] | None = None) -> None:
     checkpoint = Path(args.checkpoint).resolve()
     require_hadoop_filesystem("The Structured Streaming job (checkpointing)")
 
-    def pipeline_factory() -> StreamPipeline:
-        store = HBaseJobStore.connect(
-            args.hbase_mode,
-            host=args.hbase_host,
-            port=args.hbase_port,
-            path=args.hbase_path,
-            retries=12,
-        )
-        return StreamPipeline(store, lake_root, source="spark-structured-streaming")
+    hbase = {
+        "mode": args.hbase_mode,
+        "host": args.hbase_host,
+        "port": args.hbase_port,
+        "path": str(Path(args.hbase_path).resolve()),
+        "retries": 12,
+    }
 
     spark = build_spark_session(
         "CareerPulse Structured Streaming",
@@ -308,7 +429,12 @@ def main(argv: List[str] | None = None) -> None:
             trigger(
                 events.writeStream
                 .queryName("careerpulse_events")
-                .foreachBatch(make_batch_processor(pipeline_factory))
+                .foreachBatch(make_batch_processor(
+                    hbase=hbase,
+                    lake_root=lake_root,
+                    num_partitions=args.partitions or spark.sparkContext.defaultParallelism,
+                    source=lambda: stream_label(checkpoint / "events"),
+                ))
                 .option("checkpointLocation", str(checkpoint / "events"))
             ).start()
         )
@@ -320,7 +446,11 @@ def main(argv: List[str] | None = None) -> None:
                 .queryName("careerpulse_window_counts")
                 .outputMode("update")
                 .foreachBatch(make_window_writer(lake_root))
-                .option("checkpointLocation", str(checkpoint / "windows"))
+                # Stateful aggregation state is tied to its schema; bump the
+                # version whenever window_counts() output changes so the query
+                # rebuilds its window state from Kafka instead of failing with
+                # STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE.
+                .option("checkpointLocation", str(checkpoint / f"windows-v{WINDOW_STATE_VERSION}"))
             ).start()
         )
 

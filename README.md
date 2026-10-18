@@ -41,10 +41,12 @@ See [docs/architecture.md](./docs/architecture.md) for the data model and design
 | Change detection | Each event is compared with the job's HBase state to give NEW / MODIFIED (with changed fields) / CLOSED / DUPLICATE ([src/streaming/change_detection.py](./src/streaming/change_detection.py)) |
 | HBase | `job_history` stores versioned `info` cells and a wide `events:<epoch_ms>#<seq>` history row; `company_stats` holds atomic counters ([src/storage/hbase_store.py](./src/storage/hbase_store.py)) |
 | Parquet | Date-partitioned event lake, quarantine and window aggregates, written atomically ([src/storage/parquet_store.py](./src/storage/parquet_store.py)) |
-| Time-series / streaming windows | Watermarked sliding windows (5 min every 1 min) over event time; timestamped HBase cell versions |
+| Time-series / streaming windows | Watermarked sliding windows (5 min every 1 min) over event time, with HyperLogLog++ distinct jobs and companies per window; timestamped HBase cell versions |
 | Spark SQL | Hiring trends by company, location and category; average salary by category; new jobs in the last N minutes; modified and closed counts ([src/analytics/spark_analytics.py](./src/analytics/spark_analytics.py)) |
 | Spark RDD | Top-k companies and top-k *trending* companies via map → filter → reduceByKey → takeOrdered |
 | ML | Spark MLlib linear regression forecasting next-bucket NEW postings per category from lag features, compared against a naive baseline ([src/analytics/demand_model.py](./src/analytics/demand_model.py)) |
+| Near-duplicate detection | Spark MLlib MinHash LSH over character shingles finds open postings that are near-duplicates (including cross-source re-posts) without an O(n²) all-pairs scan ([src/analytics/near_duplicates.py](./src/analytics/near_duplicates.py)) |
+| Distributed, replay-safe processing | Micro-batches are repartitioned by `job_id` and processed on executors in parallel (one writer per job). Deterministic event IDs and an HBase applied-event ledger make crash replays exactly-once in effect. See [architecture §11](./docs/architecture.md#11-concurrency-parallelism-and-performance) |
 | DuckDB | Dashboard query layer over the Parquet lake ([src/analytics/duckdb_queries.py](./src/analytics/duckdb_queries.py)) |
 | Dashboard | Streamlit **Streaming analytics** page: live feed, KPIs, windows, trends, quarantine, Spark outputs, HBase job lookup |
 
@@ -118,6 +120,18 @@ scripts/run_pipeline.py           local end-to-end run
 docker/spark/                     Linux Spark image
 compose.yaml                      Kafka, HBase, Spark streaming and analytics
 ```
+
+## Performance
+
+Measured with [scripts/benchmark.py](./scripts/benchmark.py); details and method are in [docs/benchmarks.md](./docs/benchmarks.md).
+
+| Measure | Result |
+|---|---|
+| Local pipeline throughput | 244 → 1,979 events/s (8.1×) |
+| Kafka producer throughput | 440 → 7,362 events/s (16.7×, pipelined sends) |
+| Streaming handler scaling on real HBase | 673 → 2,881 events/s from 1 → 8 partitions (4.3×) |
+| End-to-end latency, 10 s / 1 s trigger | p95 10.5 s / 5.6 s |
+| Crash and replay audit | 7,880 Kafka records = 7,770 processed + 110 quarantined, 0 duplicates |
 
 ## Tests
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,9 @@ def window_schema():
         ("window_end", _ts_type()),
         ("event", pa.string()),
         ("count", pa.int64()),
+        # HyperLogLog++ estimates; null in files written before they existed.
+        ("unique_jobs", pa.int64()),
+        ("unique_companies", pa.int64()),
     ])
 
 
@@ -108,8 +112,22 @@ def _atomic_write_table(table, target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     pq.write_table(table, temp)
-    os.replace(temp, target)
+    _replace_with_retry(temp, target)
     return target
+
+
+def _replace_with_retry(source: Path, target: Path, attempts: int = 20) -> None:
+    # On Windows, replacing a file that a reader (e.g. the dashboard) has open
+    # raises PermissionError until the reader closes it; POSIX never blocks.
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt + 1 == attempts:
+                source.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _rows_for_schema(records: Iterable[Dict[str, Any]], schema) -> List[Dict[str, Any]]:
@@ -141,7 +159,12 @@ def append_partitioned(
     time_field: str,
     label: str = "",
 ) -> int:
-    """Append records as one Parquet file per ``event_date`` partition."""
+    """Write records as one Parquet file per ``event_date`` partition.
+
+    With a ``label`` the file name is deterministic (``part-<label>.parquet``),
+    so re-running the same micro-batch partition replaces its earlier output
+    instead of duplicating it. Without one, a unique name is generated.
+    """
     _require_pyarrow()
     rows = _rows_for_schema(records, schema)
     if not rows:
@@ -151,14 +174,10 @@ def append_partitioned(
         moment = row.get(time_field) or datetime.now(timezone.utc)
         by_date.setdefault(moment.strftime("%Y-%m-%d"), []).append(row)
 
-    suffix = f"{label}-" if label else ""
+    name = f"part-{label}.parquet" if label else f"part-{uuid.uuid4().hex[:12]}.parquet"
     for event_date, items in by_date.items():
         table = pa.Table.from_pylist(items, schema=schema)
-        target = (
-            Path(lake_root) / dataset / f"event_date={event_date}"
-            / f"part-{suffix}{uuid.uuid4().hex[:12]}.parquet"
-        )
-        _atomic_write_table(table, target)
+        _atomic_write_table(table, Path(lake_root) / dataset / f"event_date={event_date}" / name)
     return len(rows)
 
 
@@ -229,7 +248,7 @@ def write_json(payload: Dict[str, Any], path: str | Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     temp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    os.replace(temp, target)
+    _replace_with_retry(temp, target)
     return target
 
 

@@ -148,15 +148,21 @@ class LakeQueries:
         path = self._glob(parquet_store.WINDOW_DATASET)
         if path is None:
             return []
-        return self._rows(
+        # SELECT * so a window file written before the distinct-count columns
+        # existed still reads; those rows get None.
+        rows = self._rows(
             f"""
             SELECT * FROM (
-                SELECT window_start, window_end, event, count FROM read_parquet('{path}')
+                SELECT * FROM read_parquet('{path}')
                 ORDER BY window_start DESC LIMIT ?
             ) ORDER BY window_start, event
             """,
             [limit],
         )
+        for row in rows:
+            row.setdefault("unique_jobs", None)
+            row.setdefault("unique_companies", None)
+        return rows
 
     def quarantine_summary(self) -> List[Dict[str, Any]]:
         path = self._glob(parquet_store.QUARANTINE_DATASET)

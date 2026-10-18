@@ -114,7 +114,24 @@ The **Streaming analytics** page shows:
 - The MLlib forecast with RMSE vs a naive baseline
 - An HBase job lookup: current state, salary cell versions, and the wide-row event history
 
-## 4. Tests
+## 4. Benchmarks
+
+```powershell
+python scripts/benchmark.py pipeline --events 20000                 # single-process pipeline throughput
+python scripts/benchmark.py producer --events 20000                 # Kafka: acknowledged-per-event vs pipelined
+python scripts/benchmark.py spark --events 20000 --partitions 1 2 4 8   # foreachBatch scaling (embedded HBase)
+python scripts/benchmark.py latency --lake data/lake --minutes 10   # end-to-end latency of live events
+```
+
+To measure scaling against the real HBase in Docker (throwaway `bench_p<N>_` tables, dropped afterwards):
+
+```powershell
+docker compose --profile analytics run --rm --no-deps spark-analytics python scripts/benchmark.py spark --hbase-mode thrift --hbase-host hbase
+```
+
+Results are recorded in [benchmarks.md](./benchmarks.md).
+
+## 5. Tests
 
 ```powershell
 python -m pytest -q
@@ -122,10 +139,12 @@ python -m pytest -q
 
 - `test_spark_jobs.py`: Spark ETL parity with the Python rules, the `foreachBatch` handler, window logic, Spark SQL, RDD, and MLlib.
 - `test_streaming.py`: Spark batch aggregation.
+- `test_near_duplicates.py`: open-posting state, MinHash LSH pairs vs an exact all-pairs Jaccard scan, and the run_analytics output table.
+- Concurrency and fault tolerance: `test_counter_increments_are_atomic_across_processes` (4 OS processes on one counter), `test_replaying_a_batch_is_idempotent`, `test_parallel_partitions_match_sequential_processing`, and the replay check in `test_foreach_batch_handler_runs_change_detection_and_storage`.
 
 Both start a local Spark session (Java required) but use in-memory DataFrames. Everything else is pure Python.
 
-## 5. Public-board ingestion
+## 6. Public-board ingestion
 
 See [ingestion.md](./ingestion.md). In short:
 
@@ -143,4 +162,5 @@ python -m src.ingestion.service --config .\data\ingestion.local.json [--spark-ba
 | `Failed to find data source: kafka` | The connector package could not be downloaded. Check internet access, or set `CAREERPULSE_SCALA_VERSION` if your Spark build is not Scala 2.13 |
 | Streaming container restarts with HBase errors | HBase takes about a minute to accept Thrift clients. The job retries the connection for about a minute, and Docker restarts it after that |
 | Spark image build times out downloading PySpark (~450 MB) | Put a `pyspark-<version>-py2.py3-none-any.whl` in `docker/spark/wheels/` (git-ignored). The build installs it instead of downloading. `pip cache list --format abspath pyspark` finds one if PySpark was installed locally |
+| `STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE` after upgrading | The window aggregation's output changed, so its old checkpoint state no longer fits. Bump `WINDOW_STATE_VERSION` in `spark_kafka_consumer.py`; the windows query then starts a fresh checkpoint (`windows-v<N>`). It rebuilds window state from Kafka only with `--starting-offsets earliest` (the default) while the topic still retains those offsets; otherwise windows start empty. Existing rows in `window_counts.parquet` are kept, because the merge upserts. The events query keeps its own checkpoint either way |
 | Dashboard shows no window counts | Windows are emitted as event time advances. Keep the producer streaming |

@@ -137,6 +137,11 @@ def _render_live(st, pd, queries: LakeQueries, lake: Path) -> None:
     if chart is not None:
         st.caption("Sliding event-time windows (watermarked) computed by Spark Structured Streaming.")
         st.line_chart(chart)
+        with_distinct = [row for row in windows if row.get("unique_jobs") is not None]
+        if with_distinct:
+            st.markdown("#### Distinct jobs per window")
+            st.caption("HyperLogLog++ estimates (`approx_count_distinct`, ~2% relative error); exact distinct counts are not supported in streaming aggregations.")
+            st.line_chart(pivot(with_distinct, "window_start", "event", "unique_jobs"))
     else:
         st.info("Window aggregates appear once the Structured Streaming job has emitted windows.")
 
@@ -203,6 +208,18 @@ def _render_spark_outputs(st, pd, queries: LakeQueries) -> None:
             st.bar_chart(pd.DataFrame(predictions).set_index("category")[["last_bucket_new", "predicted_next_new"]])
     elif model:
         st.warning(model.get("message") or "The demand model was not trained.")
+
+    duplicates = summary.get("near_duplicates") or {}
+    if duplicates:
+        st.markdown("#### Near-duplicate postings · MinHash LSH")
+        st.caption(
+            f"{duplicates.get('pairs_found', 0):,} pairs across {duplicates.get('jobs_involved', 0):,} of "
+            f"{duplicates.get('open_postings', 0):,} open postings with Jaccard similarity ≥ {duplicates.get('min_similarity')} "
+            f"on character 3-grams ({duplicates.get('num_hash_tables')} hash tables; exact similarity is computed for every candidate)."
+        )
+        pairs = queries.analytics_table("near_duplicate_postings")
+        if pairs:
+            st.dataframe(pairs, use_container_width=True, hide_index=True)
 
     with st.expander("Spark SQL hiring-trend tables"):
         for name in ("event_counts", "recent_new_jobs", "top_companies_new", "avg_salary_by_category",

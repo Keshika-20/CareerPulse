@@ -81,6 +81,16 @@ class KafkaJobProducer:
             bootstrap_servers=servers,
             value_serializer=JsonSerializer(),
             key_serializer=KeySerializer(),
+            # acks=all + idempotence: broker-side de-duplication of retried
+            # sends and no reordering within a partition even with several
+            # requests in flight, so each job's events keep their order.
+            acks="all",
+            enable_idempotence=True,
+            # Small linger + larger batches + compression trade a few ms of
+            # latency for far fewer, smaller produce requests.
+            linger_ms=5,
+            batch_size=64 * 1024,
+            compression_type="gzip",
         )
 
     @staticmethod
@@ -92,12 +102,29 @@ class KafkaJobProducer:
         return None
 
     def send_event(self, event: Any) -> None:
+        """Send one event and wait for the broker acknowledgement.
+
+        Used where the caller must know the event is durable before moving on
+        (the ingestion outbox marks events published only after this returns).
+        """
         future = self._producer.send(self.topic, value=event, key=self.message_key(event))
         future.get(timeout=self.timeout_seconds)
 
-    def send_batch(self, events: Iterable[dict]) -> None:
-        for event in events:
-            self.send_event(event)
+    def send_async(self, event: Any):
+        """Queue one event without waiting; returns the delivery future."""
+        return self._producer.send(self.topic, value=event, key=self.message_key(event))
+
+    def send_batch(self, events: Iterable[Any]) -> int:
+        """Pipeline many sends, then wait once for every acknowledgement.
+
+        Raises on the first failed delivery after flushing, so a batch is only
+        reported as sent when all of it is acknowledged.
+        """
+        futures = [self.send_async(event) for event in events]
+        self._producer.flush()  # bounded by the producer's delivery timeout
+        for future in futures:
+            future.get(timeout=self.timeout_seconds)
+        return len(futures)
 
     def close(self) -> None:
         if self._producer is not None:
@@ -117,16 +144,23 @@ def stream_events(
     interval = 1.0 / rate
     started = time.monotonic()
     sent = 0
+    pending = []
     while (max_events is None or sent < max_events) and (
         duration_seconds is None or time.monotonic() - started < duration_seconds
     ):
-        producer.send_event(simulator.next_event())
+        pending.append(producer.send_async(simulator.next_event()))
         sent += 1
         if sent % 50 == 0:
+            # Surface delivery errors periodically instead of blocking per event.
+            for future in pending:
+                future.get(timeout=producer.timeout_seconds)
+            pending.clear()
             print(f"Published {sent} events", flush=True)
         delay = started + sent * interval - time.monotonic()
         if delay > 0:
             time.sleep(delay)
+    for future in pending:
+        future.get(timeout=producer.timeout_seconds)
     return sent
 
 

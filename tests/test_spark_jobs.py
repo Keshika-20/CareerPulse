@@ -61,8 +61,8 @@ def spark():
 
 
 def _kafka_frame(spark, values):
-    rows = [(value.encode("utf-8"), 0, offset) for offset, value in enumerate(values)]
-    return spark.createDataFrame(rows, "value binary, partition int, offset long")
+    rows = [(value.encode("utf-8"), "job-events", offset % 3, offset) for offset, value in enumerate(values)]
+    return spark.createDataFrame(rows, "value binary, topic string, partition int, offset long")
 
 
 def _events_frame(spark, records):
@@ -89,20 +89,52 @@ def test_spark_etl_matches_python_rules(spark):
 
 
 def test_foreach_batch_handler_runs_change_detection_and_storage(spark, tmp_path):
-    store = HBaseJobStore()
-    process = make_batch_processor(lambda: StreamPipeline(store, tmp_path, source="test"))
+    hbase = {"mode": "local", "path": str(tmp_path / "hbase.sqlite3")}
+    process = make_batch_processor(hbase=hbase, lake_root=tmp_path / "lake", num_partitions=2, source="test")
     values = [
         json.dumps(BASE),
         json.dumps({**BASE, "salary": 2000000, "event": "MODIFIED", "timestamp": "2026-10-06T10:05:00Z"}),
         json.dumps({**BASE, "salary": 2000000, "event": "NEW", "timestamp": "2026-10-06T10:06:00Z"}),
         "{not json",
     ]
-    process(apply_etl(parse_kafka_values(_kafka_frame(spark, values))), 0)
+    batch = apply_etl(parse_kafka_values(_kafka_frame(spark, values)))
+    process(batch, 0)
+    process(batch, 0)  # replay of the same micro-batch must not change anything
 
-    events = parquet_store.read_dataset(tmp_path)
+    events = parquet_store.read_dataset(tmp_path / "lake")
     assert list(events.sort_values("event_time")["event"]) == ["NEW", "MODIFIED", "DUPLICATE"]
+    assert set(events["event_id"]) == {"job-events-0-0", "job-events-1-1", "job-events-2-2"}
+    store = HBaseJobStore.connect("local", path=hbase["path"])
     assert store.get_job("J1")["salary"] == 2000000.0
-    assert len(parquet_store.read_dataset(tmp_path, parquet_store.QUARANTINE_DATASET)) == 1
+    assert store.company_stats()[0]["NEW"] == 1
+    store.close()
+    assert len(parquet_store.read_dataset(tmp_path / "lake", parquet_store.QUARANTINE_DATASET)) == 1
+
+
+def test_parallel_partitions_match_sequential_processing(spark, tmp_path):
+    raw = JobEventSimulator(seed=13, invalid_rate=0.05).generate(
+        600, start=datetime(2026, 10, 6, tzinfo=timezone.utc), span=timedelta(hours=2)
+    )
+    values = [value if isinstance(value, str) else json.dumps(value) for value in raw]
+    batch = apply_etl(parse_kafka_values(_kafka_frame(spark, values)))
+
+    results = {}
+    for partitions in (1, 4):
+        root = tmp_path / f"p{partitions}"
+        hbase = {"mode": "local", "path": str(root / "hbase.sqlite3")}
+        make_batch_processor(hbase=hbase, lake_root=root / "lake", num_partitions=partitions, source="t")(batch, 0)
+        store = HBaseJobStore.connect("local", path=hbase["path"])
+        events = parquet_store.read_dataset(root / "lake").sort_values("event_id")
+        results[partitions] = (
+            list(zip(events["event_id"], events["event"])),
+            {job: state["status"] for job, state in store.list_jobs().items()},
+            sorted(map(str, store.company_stats())),
+        )
+        store.close()
+
+    # Partitioning by job_id makes parallel processing produce exactly the sequential result.
+    assert results[1] == results[4]
+    assert len(results[4][0]) > 500
 
 
 def test_window_counts_slide_over_event_time(spark):
@@ -117,6 +149,28 @@ def test_window_counts_slide_over_event_time(spark):
     }
     assert ("2026-10-06T10:00:00.000000Z", 2) in windows
     assert ("2026-10-06T10:02:00.000000Z", 1) in windows
+
+
+def test_window_counts_estimate_distinct_jobs_and_companies(spark):
+    values = [
+        json.dumps({**BASE, "job_id": "J0", "timestamp": "2026-10-06T10:00:10Z"}),
+        json.dumps({**BASE, "job_id": "J0", "timestamp": "2026-10-06T10:00:20Z"}),  # same job again
+        json.dumps({**BASE, "job_id": "J1", "company": "Amazon", "timestamp": "2026-10-06T10:00:30Z"}),
+    ] + [
+        json.dumps({**BASE, "job_id": f"K{index}", "company": f"Co{index % 40}", "timestamp": "2026-10-06T10:10:00Z"})
+        for index in range(500)
+    ]
+    valid = apply_etl(parse_kafka_values(_kafka_frame(spark, values))).where("validation_error IS NULL")
+    rows = {
+        row["window_start"]: row
+        for row in window_counts(valid, watermark="10 minutes", window="1 minute", slide="1 minute").collect()
+    }
+    small = rows["2026-10-06T10:00:00.000000Z"]
+    assert (small["count"], small["unique_jobs"], small["unique_companies"]) == (3, 2, 2)
+    large = rows["2026-10-06T10:10:00.000000Z"]
+    assert large["count"] == 500
+    assert abs(large["unique_jobs"] - 500) <= 500 * 0.06  # 3 x the configured 2% rsd
+    assert abs(large["unique_companies"] - 40) <= 2
 
 
 def _lake_records():

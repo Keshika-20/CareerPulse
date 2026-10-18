@@ -3,14 +3,22 @@
 Data model (table ``job_history``, row key = ``job_id``):
 
 * ``info:*``   current job state, one JSON-encoded cell per field. The family
-  keeps several cell versions, timestamped with the event time, so earlier
-  values (e.g. salary revisions) stay readable with ``cells()``.
-* ``events:<epoch_ms>#<seq>`` one column per lifecycle change. A job's row is
-  therefore a wide, time-ordered event log - the classic HBase time-series
-  layout.
+  keeps several cell versions, timestamped with the event time, and only
+  changed cells are rewritten, so a cell's versions are its change history.
+* ``events:<epoch_ms:013d>#<event_id>`` one column per processed event. A job's
+  row is a wide, time-ordered event log (the classic HBase time-series
+  layout). Because the qualifier embeds the deterministic event ID, the same
+  column doubles as an idempotency ledger: a replayed event is recognised and
+  its original classification reused instead of being re-applied.
 
 Table ``company_stats`` (row key = company) keeps HBase atomic counters
-``stats:<EVENT>`` for every processed event type.
+``stats:<EVENT>``.
+
+Concurrency model: every event of one job is processed by exactly one writer
+(Kafka is keyed by job_id and Spark repartitions micro-batches by job_id), so a
+row is never mutated concurrently and read-then-write per row is safe without
+check-and-put. Counters are the only cells shared across writers and use
+HBase's server-side atomic increment.
 
 ``HBaseJobStore`` talks to anything implementing the small happybase API
 subset used here: a real ``happybase.Connection`` (HBase Thrift server) or
@@ -25,6 +33,8 @@ import sqlite3
 import struct
 import threading
 import time
+from collections import Counter, defaultdict
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -52,6 +62,7 @@ STATE_FIELDS = (
     "last_event_time",
     "fingerprint",
 )
+MULTI_GET_CHUNK = 500
 
 
 def _b(value: Any) -> bytes:
@@ -62,6 +73,33 @@ def _b(value: Any) -> bytes:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+class LocalBatch:
+    """happybase.Batch-compatible mutation buffer, applied in one transaction."""
+
+    def __init__(self, table: "LocalTable", timestamp: Optional[int] = None) -> None:
+        self.table = table
+        self.timestamp = timestamp
+        self._puts: List[Tuple[Any, Dict[Any, Any]]] = []
+
+    def put(self, row: Any, data: Dict[Any, Any], wal: Any = None) -> None:
+        self._puts.append((row, data))
+
+    def send(self) -> None:
+        if not self._puts:
+            return
+        with self.table.connection._write():
+            for row, data in self._puts:
+                self.table._put_unlocked(row, data, self.timestamp)
+        self._puts = []
+
+    def __enter__(self) -> "LocalBatch":
+        return self
+
+    def __exit__(self, exc_type, *_exc) -> None:
+        if exc_type is None:
+            self.send()
 
 
 class LocalTable:
@@ -77,31 +115,43 @@ class LocalTable:
             raise ValueError(f"Table {self.name.decode()} does not exist.")
         return families
 
-    def put(self, row: Any, data: Dict[Any, Any], timestamp: Optional[int] = None) -> None:
+    def _put_unlocked(self, row: Any, data: Dict[Any, Any], timestamp: Optional[int]) -> None:
         families = self._families()
         ts = int(timestamp) if timestamp is not None else _now_ms()
-        with self.connection._lock, self.connection._db:
-            for column, value in data.items():
-                column_b = _b(column)
-                family = column_b.split(b":", 1)[0]
-                if family not in families:
-                    raise ValueError(f"Unknown column family {family.decode()!r}.")
-                self.connection._db.execute(
-                    "INSERT OR REPLACE INTO cells (tbl, row, col, ts, value) VALUES (?, ?, ?, ?, ?)",
-                    (self.name, _b(row), column_b, ts, _b(value)),
-                )
-                self._trim_versions(_b(row), column_b, families[family])
-
-    def _trim_versions(self, row: bytes, column: bytes, max_versions: int) -> None:
-        self.connection._db.execute(
-            """
-            DELETE FROM cells WHERE tbl = ? AND row = ? AND col = ? AND ts NOT IN (
-                SELECT ts FROM cells WHERE tbl = ? AND row = ? AND col = ?
-                ORDER BY ts DESC LIMIT ?
+        db = self.connection._db
+        for column, value in data.items():
+            column_b = _b(column)
+            family = column_b.split(b":", 1)[0]
+            if family not in families:
+                raise ValueError(f"Unknown column family {family.decode()!r}.")
+            db.execute(
+                "INSERT OR REPLACE INTO cells (tbl, row, col, ts, value) VALUES (?, ?, ?, ?, ?)",
+                (self.name, _b(row), column_b, ts, _b(value)),
             )
-            """,
-            (self.name, row, column, self.name, row, column, max_versions),
-        )
+            if families[family] > 1:
+                # Drop versions older than the newest N; the OFFSET lookup walks
+                # the primary-key index and is a no-op until N is exceeded.
+                db.execute(
+                    """
+                    DELETE FROM cells WHERE tbl = ? AND row = ? AND col = ? AND ts <= (
+                        SELECT ts FROM cells WHERE tbl = ? AND row = ? AND col = ?
+                        ORDER BY ts DESC LIMIT 1 OFFSET ?
+                    )
+                    """,
+                    (self.name, _b(row), column_b, self.name, _b(row), column_b, families[family]),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM cells WHERE tbl = ? AND row = ? AND col = ? AND ts < ?",
+                    (self.name, _b(row), column_b, ts),
+                )
+
+    def put(self, row: Any, data: Dict[Any, Any], timestamp: Optional[int] = None) -> None:
+        with self.connection._write():
+            self._put_unlocked(row, data, timestamp)
+
+    def batch(self, timestamp: Optional[int] = None, **_options: Any) -> LocalBatch:
+        return LocalBatch(self, timestamp)
 
     @staticmethod
     def _matches(column: bytes, columns: Optional[Iterable[Any]]) -> bool:
@@ -212,20 +262,33 @@ class LocalTable:
         return struct.unpack(">q", values[0])[0] if values else 0
 
     def counter_inc(self, row: Any, column: Any, value: int = 1) -> int:
-        with self.connection._lock:
-            updated = self.counter_get(row, column) + int(value)
-            self.put(row, {column: struct.pack(">q", updated)})
+        # Read and write inside one IMMEDIATE transaction: the database write
+        # lock makes the increment atomic across threads *and* processes.
+        with self.connection._write():
+            current = self.connection._db.execute(
+                "SELECT value FROM cells WHERE tbl = ? AND row = ? AND col = ? ORDER BY ts DESC LIMIT 1",
+                (self.name, _b(row), _b(column)),
+            ).fetchone()
+            updated = (struct.unpack(">q", bytes(current[0]))[0] if current else 0) + int(value)
+            self.connection._db.execute(
+                "DELETE FROM cells WHERE tbl = ? AND row = ? AND col = ?",
+                (self.name, _b(row), _b(column)),
+            )
+            self.connection._db.execute(
+                "INSERT INTO cells (tbl, row, col, ts, value) VALUES (?, ?, ?, ?, ?)",
+                (self.name, _b(row), _b(column), _now_ms(), struct.pack(">q", updated)),
+            )
         return updated
 
     def delete(self, row: Any, columns: Optional[Iterable[Any]] = None) -> None:
-        with self.connection._lock, self.connection._db:
+        existing = self.row(row, columns=columns) if columns else None
+        with self.connection._write():
             if not columns:
                 self.connection._db.execute(
                     "DELETE FROM cells WHERE tbl = ? AND row = ?", (self.name, _b(row))
                 )
                 return
-            existing = self.row(row, columns=columns)
-            for column in existing:
+            for column in existing or {}:
                 self.connection._db.execute(
                     "DELETE FROM cells WHERE tbl = ? AND row = ? AND col = ?",
                     (self.name, _b(row), column),
@@ -237,7 +300,9 @@ class LocalHBaseConnection:
 
     It keeps HBase's data model - tables, column families, timestamped cell
     versions with a per-family version limit, row scans and atomic counters -
-    in SQLite, so state survives restarts when a file path is given.
+    in SQLite, so state survives restarts when a file path is given. Several
+    processes may share one file: writes take SQLite's write lock up front
+    (``BEGIN IMMEDIATE``) and WAL mode lets readers proceed concurrently.
     """
 
     def __init__(self, path: str | Path | None = None, *, read_only: bool = False) -> None:
@@ -245,15 +310,18 @@ class LocalHBaseConnection:
         if path and not read_only:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         if path and read_only:
-            uri = Path(path).resolve().as_uri() + "?mode=ro"
-            self._db = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=10)
+            target = Path(path).resolve().as_uri() + "?mode=ro"
+            self._db = sqlite3.connect(target, uri=True, check_same_thread=False, timeout=30, isolation_level=None)
         else:
-            self._db = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
+            self._db = sqlite3.connect(self.path, check_same_thread=False, timeout=30, isolation_level=None)
         self._lock = threading.RLock()
+        self._depth = 0
+        self._family_cache: Dict[bytes, Dict[bytes, int]] = {}
         if not read_only:
             if path:
                 self._db.execute("PRAGMA journal_mode=WAL")
-            with self._db:
+                self._db.execute("PRAGMA synchronous=NORMAL")
+            with self._write():
                 self._db.execute(
                     """
                     CREATE TABLE IF NOT EXISTS families (
@@ -268,18 +336,52 @@ class LocalHBaseConnection:
                         tbl BLOB NOT NULL, row BLOB NOT NULL, col BLOB NOT NULL,
                         ts INTEGER NOT NULL, value BLOB NOT NULL,
                         PRIMARY KEY (tbl, row, col, ts)
-                    )
+                    ) WITHOUT ROWID
                     """
                 )
 
-    def _families(self, table: bytes) -> Dict[bytes, int]:
+    @contextmanager
+    def _write(self):
+        """One write transaction; nested calls join the outermost one."""
         with self._lock:
-            return {
+            if self._depth:
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
+            self._db.execute("BEGIN IMMEDIATE")
+            self._depth = 1
+            try:
+                yield
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            else:
+                self._db.execute("COMMIT")
+            finally:
+                self._depth = 0
+
+    def atomic(self):
+        """Group many puts/batches into a single transaction (one disk sync)."""
+        return self._write()
+
+    def _families(self, table: bytes) -> Dict[bytes, int]:
+        # Schemas are immutable once created, so they are cached per connection.
+        cached = self._family_cache.get(table)
+        if cached:
+            return cached
+        with self._lock:
+            families = {
                 bytes(family): max_versions
                 for family, max_versions in self._db.execute(
                     "SELECT family, max_versions FROM families WHERE tbl = ?", (table,)
                 )
             }
+        if families:
+            self._family_cache[table] = families
+        return families
 
     def tables(self) -> List[bytes]:
         with self._lock:
@@ -287,9 +389,9 @@ class LocalHBaseConnection:
 
     def create_table(self, name: Any, families: Dict[Any, Dict[str, Any]]) -> None:
         name_b = _b(name)
-        if name_b in self.tables():
-            raise ValueError(f"Table {name_b.decode()} already exists.")
-        with self._lock, self._db:
+        with self._write():
+            if name_b in self.tables():
+                raise ValueError(f"Table {name_b.decode()} already exists.")
             for family, options in families.items():
                 self._db.execute(
                     "INSERT INTO families (tbl, family, max_versions) VALUES (?, ?, ?)",
@@ -329,13 +431,20 @@ def _epoch_ms(iso_timestamp: Optional[str]) -> int:
     return int(parsed.timestamp() * 1000)
 
 
+def _history_qualifier(ts: int, event_id: str) -> str:
+    return f"events:{ts:013d}#{event_id}"
+
+
+def _event_id_from_qualifier(column: bytes) -> str:
+    return column.split(b"#", 1)[1].decode() if b"#" in column else ""
+
+
 class HBaseJobStore:
     def __init__(self, connection: Any = None, *, table_prefix: str = "") -> None:
         self.connection = connection if connection is not None else LocalHBaseConnection()
         self.table_prefix = table_prefix
         self.job_table_name = f"{table_prefix}{JOB_TABLE}"
         self.stats_table_name = f"{table_prefix}{STATS_TABLE}"
-        self._event_seq = 0
         self.ensure_tables()
 
     @classmethod
@@ -386,8 +495,14 @@ class HBaseJobStore:
                 continue
             try:
                 self.connection.create_table(name, families)
-            except Exception:
-                # A read-only emulator or a table created concurrently is fine.
+            except Exception as exc:
+                # Several workers can race to create the same table; losing that
+                # race ("already exists"/"already in use") is success. HBase may
+                # not list a table that is still being created, so the error
+                # text is trusted rather than an immediate tables() re-check.
+                message = str(getattr(exc, "message", "") or exc).lower()
+                if "already" in message or type(exc).__name__ == "AlreadyExists":
+                    continue
                 if _b(name) not in {_b(table) for table in self.connection.tables()}:
                     raise
 
@@ -399,11 +514,40 @@ class HBaseJobStore:
     def stats(self):
         return self.connection.table(self.stats_table_name)
 
+    @staticmethod
+    def _state_from_cells(data: Dict[bytes, bytes]) -> Optional[Dict[str, Any]]:
+        state = {
+            key.split(b":", 1)[1].decode(): _decode(value)
+            for key, value in data.items()
+            if key.startswith(b"info:")
+        }
+        return state or None
+
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        data = self.jobs.row(str(job_id), columns=[b"info"])
-        if not data:
-            return None
-        return {key.split(b":", 1)[1].decode(): _decode(value) for key, value in data.items()}
+        return self._state_from_cells(self.jobs.row(str(job_id), columns=[b"info"]))
+
+    def load_states(
+        self, job_ids: Iterable[str]
+    ) -> Tuple[Dict[str, Optional[Dict[str, Any]]], Dict[str, Dict[str, Dict[str, Any]]]]:
+        """Multi-get current state and the applied-event ledger for many jobs.
+
+        Returns ``(states, applied)`` where ``applied[job_id][event_id]`` is the
+        stored history entry of every event already applied to that job.
+        """
+        keys = list(dict.fromkeys(str(job_id) for job_id in job_ids))
+        states: Dict[str, Optional[Dict[str, Any]]] = {key: None for key in keys}
+        applied: Dict[str, Dict[str, Dict[str, Any]]] = {key: {} for key in keys}
+        table = self.jobs
+        for start in range(0, len(keys), MULTI_GET_CHUNK):
+            for key, data in table.rows(keys[start:start + MULTI_GET_CHUNK], columns=[b"info", b"events"]):
+                job_id = key.decode()
+                states[job_id] = self._state_from_cells(data)
+                applied[job_id] = {
+                    _event_id_from_qualifier(column): _decode(value)
+                    for column, value in data.items()
+                    if column.startswith(b"events:")
+                }
+        return states, applied
 
     def put_job(
         self,
@@ -412,79 +556,113 @@ class HBaseJobStore:
         timestamp: Optional[int] = None,
         previous: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Write a job's current state into the ``info`` family.
+        """Write a job's current state into the ``info`` family (single job)."""
+        state, cells = self._state_cells(job_event, previous)
+        ts = timestamp if timestamp is not None else _epoch_ms(job_event.get("timestamp"))
+        if cells:
+            self.jobs.put(state["job_id"], cells, timestamp=ts)
+        return self.get_job(state["job_id"]) or state
 
-        With ``previous``, only cells whose value changed are written, so each
-        cell's version history records real changes (e.g. salary revisions).
-        """
+    @staticmethod
+    def _state_cells(
+        job_event: Dict[str, Any], previous: Optional[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Any], Dict[str, bytes]]:
         state = {field: job_event.get(field) for field in STATE_FIELDS if field in job_event}
         state["job_id"] = str(job_event["job_id"])
         if "status" not in state:
             state["status"] = "CLOSED" if str(job_event.get("event", "")).upper() == "CLOSED" else "OPEN"
-        ts = timestamp if timestamp is not None else _epoch_ms(job_event.get("timestamp"))
+        # Only changed cells are written so each cell's versions are its history.
         cells = {
             f"info:{field}": _encode(value)
             for field, value in state.items()
             if previous is None or field not in previous or previous[field] != value
         }
-        if cells:
-            self.jobs.put(state["job_id"], cells, timestamp=ts)
-        return self.get_job(state["job_id"]) or state
+        return state, cells
+
+    @staticmethod
+    def next_state(event: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The job state after applying one detected event."""
+        detected = str(event["event"]).upper()
+        base = dict(previous or {})
+        if detected == "DUPLICATE":
+            if previous is None:
+                return base
+            return {**base, "last_seen": event.get("event_time")}
+        reopened = base.get("status") == "CLOSED" and detected == "NEW"
+        return {
+            **{field: base.get(field) for field in STATE_FIELDS if field in base},
+            **{
+                field: event.get(field)
+                for field in ("company", "title", "location", "experience", "salary", "category", "source", "fingerprint")
+                if field in event
+            },
+            "job_id": str(event["job_id"]),
+            "status": "CLOSED" if detected == "CLOSED" else "OPEN",
+            "first_seen": (None if reopened else base.get("first_seen")) or event.get("event_time"),
+            "last_seen": event.get("event_time"),
+            "last_event": detected,
+            "last_event_time": event.get("event_time"),
+        }
+
+    @staticmethod
+    def _history_entry(event: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "event": str(event["event"]).upper(),
+            "claimed_event": event.get("claimed_event"),
+            "event_time": event.get("event_time"),
+            "changed_fields": event.get("changed_fields") or "",
+            "title": event.get("title"),
+            "location": event.get("location"),
+            "salary": event.get("salary"),
+            "experience": event.get("experience"),
+            "event_id": event.get("event_id"),
+        }
+
+    def apply_events(self, items: Iterable[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]) -> int:
+        """Persist processed events in bulk.
+
+        ``items`` are ``(event, state_before_event)`` pairs in processing order.
+        All cells of one event share its timestamp and go in one mutation
+        batch (one Thrift round trip), and counter increments are aggregated
+        per (company, event) so each distinct pair costs one atomic increment.
+        """
+        groups: Dict[int, Dict[str, Dict[str, bytes]]] = defaultdict(lambda: defaultdict(dict))
+        counters: Counter = Counter()
+        applied = 0
+        for event, previous in items:
+            job_id = str(event["job_id"])
+            ts = _epoch_ms(event.get("event_time"))
+            cells: Dict[str, bytes] = {}
+            new_state = self.next_state(event, previous)
+            if new_state:
+                _state, cells = self._state_cells(new_state, previous)
+            cells[_history_qualifier(ts, str(event.get("event_id") or f"{ts}"))] = _encode(self._history_entry(event))
+            groups[ts][job_id].update(cells)
+            counters[(str(event.get("company") or "Unknown"), str(event["event"]).upper())] += 1
+            applied += 1
+
+        table = self.jobs
+        atomic = getattr(self.connection, "atomic", None)
+        with atomic() if atomic else nullcontext():
+            for ts in sorted(groups):
+                with table.batch(timestamp=ts) as batch:
+                    for job_id, cells in groups[ts].items():
+                        batch.put(job_id, cells)
+            stats = self.stats
+            for (company, detected), count in sorted(counters.items()):
+                stats.counter_inc(company, f"stats:{detected}", count)
+        return applied
 
     def apply_event(self, event: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> None:
-        """Persist one processed (change-detected) event.
+        """Persist one processed event (convenience wrapper over ``apply_events``)."""
+        self.apply_events([(event, previous)])
 
-        NEW / MODIFIED / CLOSED update the job's state and append a history
-        column; DUPLICATE only refreshes ``last_seen``. Every event increments
-        the company's counter for its type.
-        """
-        job_id = str(event["job_id"])
-        detected = str(event["event"]).upper()
-        ts = _epoch_ms(event.get("event_time"))
-
-        if detected == "DUPLICATE":
-            if previous is not None:
-                self.jobs.put(job_id, {"info:last_seen": _encode(event.get("event_time"))}, timestamp=ts)
-        else:
-            base = previous or {}
-            reopened = base.get("status") == "CLOSED" and detected == "NEW"
-            state = {
-                **{field: base.get(field) for field in STATE_FIELDS if field in base},
-                **{
-                    field: event.get(field)
-                    for field in ("company", "title", "location", "experience", "salary", "category", "source", "fingerprint")
-                    if field in event
-                },
-                "job_id": job_id,
-                "status": "CLOSED" if detected == "CLOSED" else "OPEN",
-                "first_seen": (None if reopened else base.get("first_seen")) or event.get("event_time"),
-                "last_seen": event.get("event_time"),
-                "last_event": detected,
-                "last_event_time": event.get("event_time"),
-            }
-            self.put_job(state, timestamp=ts, previous=previous)
-
-            self._event_seq = (self._event_seq + 1) % 1_000_000
-            qualifier = f"events:{ts:013d}#{self._event_seq:06d}"
-            history = {
-                "event": detected,
-                "claimed_event": event.get("claimed_event"),
-                "event_time": event.get("event_time"),
-                "changed_fields": event.get("changed_fields") or "",
-                "title": event.get("title"),
-                "location": event.get("location"),
-                "salary": event.get("salary"),
-                "experience": event.get("experience"),
-                "event_id": event.get("event_id"),
-            }
-            self.jobs.put(job_id, {qualifier: _encode(history)}, timestamp=ts)
-
-        company = str(event.get("company") or "Unknown")
-        self.stats.counter_inc(company, f"stats:{detected}")
-
-    def get_history(self, job_id: str) -> List[Dict[str, Any]]:
+    def get_history(self, job_id: str, *, include_duplicates: bool = True) -> List[Dict[str, Any]]:
         data = self.jobs.row(str(job_id), columns=[b"events"])
-        return [_decode(data[key]) for key in sorted(data)]
+        history = [_decode(data[key]) for key in sorted(data)]
+        if include_duplicates:
+            return history
+        return [entry for entry in history if entry.get("event") != "DUPLICATE"]
 
     def field_versions(self, job_id: str, field: str, versions: int = INFO_VERSIONS) -> List[Dict[str, Any]]:
         cells = self.jobs.cells(str(job_id), f"info:{field}", versions=versions, include_timestamp=True)

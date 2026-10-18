@@ -97,6 +97,38 @@ def test_duckdb_queries_over_lake(tmp_path):
     queries.close()
 
 
+def test_window_counts_from_before_distinct_columns_still_read_and_merge(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    legacy = pa.schema([
+        ("window_start", pa.timestamp("us", tz="UTC")),
+        ("window_end", pa.timestamp("us", tz="UTC")),
+        ("event", pa.string()),
+        ("count", pa.int64()),
+    ])
+    target = tmp_path / parquet_store.WINDOW_DATASET / "window_counts.parquet"
+    target.parent.mkdir(parents=True)
+    start = parquet_store.to_utc_datetime("2026-10-06T10:00:00Z")
+    end = parquet_store.to_utc_datetime("2026-10-06T10:05:00Z")
+    pq.write_table(
+        pa.Table.from_pylist([{"window_start": start, "window_end": end, "event": "NEW", "count": 2}], schema=legacy),
+        target,
+    )
+
+    queries = LakeQueries(tmp_path)
+    assert [(row["count"], row["unique_jobs"]) for row in queries.window_counts()] == [(2, None)]
+
+    parquet_store.merge_window_counts(
+        [{"window_start": "2026-10-06T10:05:00Z", "window_end": "2026-10-06T10:10:00Z", "event": "NEW",
+          "count": 4, "unique_jobs": 3, "unique_companies": 2}],
+        tmp_path,
+    )
+    rows = queries.window_counts()
+    assert [(row["count"], row["unique_jobs"], row["unique_companies"]) for row in rows] == [(2, None, None), (4, 3, 2)]
+    queries.close()
+
+
 def test_empty_lake_queries_are_safe(tmp_path):
     queries = LakeQueries(tmp_path)
     assert queries.has_events() is False
@@ -122,3 +154,34 @@ def test_producer_keys_by_job_id_and_passes_raw_payloads_through():
     serializer = JsonSerializer()
     assert serializer.serialize("topic", "{broken") == b"{broken"
     assert serializer.serialize("topic", {"a": 1}) == b'{"a": 1}'
+
+
+def test_replaying_a_batch_is_idempotent(tmp_path):
+    store = HBaseJobStore.connect("local", path=tmp_path / "hbase.sqlite3")
+    pipeline = StreamPipeline(store, tmp_path / "lake", source="test")
+    batch = [_event("J1", "NEW", 0), _event("J1", "MODIFIED", 1, salary=1700000), _event("J2", "NEW", 2), "{bad"]
+
+    first = pipeline.process_raw_records(batch, batch_id=0)
+    stats_before = store.company_stats()
+    replay = pipeline.process_raw_records(batch, batch_id=0)  # e.g. Spark re-runs the batch after a crash
+
+    # Same classification (not re-detected as DUPLICATE), no double counting.
+    assert replay["detected"] == first["detected"] == {"NEW": 2, "MODIFIED": 1}
+    assert replay["replay"] is True
+    assert store.company_stats() == stats_before
+    assert pipeline.totals["RECEIVED"] == 4
+    events = parquet_store.read_dataset(tmp_path / "lake")
+    assert len(events) == 3  # the replay overwrote its own files instead of appending
+    assert len(parquet_store.read_dataset(tmp_path / "lake", parquet_store.QUARANTINE_DATASET)) == 1
+    assert len(store.get_history("J1")) == 2
+    store.close()
+
+
+def test_event_ids_are_deterministic():
+    from src.streaming.change_detection import event_id_for
+
+    kafka_record = {"job_id": "J1", "kafka_topic": "job-events", "kafka_partition": 2, "kafka_offset": 41}
+    assert event_id_for(kafka_record) == "job-events-2-41"
+    content = {"job_id": "J1", "event_time": "t", "event": "NEW", "fingerprint": "f"}
+    assert event_id_for(content) == event_id_for(dict(content))
+    assert event_id_for(content) != event_id_for({**content, "event_time": "t2"})
