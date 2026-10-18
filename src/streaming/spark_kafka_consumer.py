@@ -1,11 +1,16 @@
 """CareerPulse Spark Structured Streaming job.
 
-Kafka topic -> JSON parsing -> validation / cleaning / enrichment (Spark
-DataFrame expressions) -> per micro-batch change detection against HBase ->
+Kafka topic -> JSON parsing -> validation / cleaning / standardisation /
+enrichment (Spark DataFrame expressions) -> per micro-batch, in parallel per
+job_id partition: raw archive (cold storage), change detection against HBase,
 HBase job state + history, Parquet event lake and quarantine.
 
-A second streaming query computes watermarked sliding-window counts of
-incoming event types into the lake's ``window_counts`` dataset.
+Two more streaming queries compute watermarked sliding windows: counts per
+incoming event type (``window_counts``) and per-category hiring metrics
+(``window_category``: new postings, closures, average salary, active
+companies), which also drive hiring-surge alerts. Data-quality alerts are
+raised from micro-batch rejection rates. Alerts go to the lake, the
+``job-alerts`` Kafka topic and an optional webhook.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -26,13 +31,22 @@ if str(ROOT) not in sys.path:
 try:
     from pyspark.sql import DataFrame
     from pyspark.sql import functions as F
-    from pyspark.sql.types import StringType, StructField, StructType
+    from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 except ImportError as exc:
     raise RuntimeError(
         "Install a compatible PySpark version before starting streaming."
     ) from exc
 
-from src.common.models import CATEGORY_RULES, DEFAULT_CATEGORY, VALID_EVENTS, job_fingerprint
+from src.common.models import (
+    CATEGORY_RULES,
+    DEFAULT_CATEGORY,
+    EMPLOYMENT_TYPES,
+    SKILL_ALIASES,
+    SKILL_PATTERNS,
+    VALID_EVENTS,
+    WORK_MODES,
+    job_fingerprint,
+)
 from src.common.spark_session import (
     build_spark_session,
     kafka_connector_package,
@@ -40,6 +54,7 @@ from src.common.spark_session import (
 )
 from src.storage import parquet_store
 from src.storage.hbase_store import HBaseJobStore
+from src.streaming.alerts import AlertConfig, AlertSink, data_quality_alert, detect_surges
 from src.streaming.etl import REQUIRED_NON_NULL, parse_timestamp
 from src.streaming.pipeline import StreamPipeline
 
@@ -61,14 +76,26 @@ EVENT_SCHEMA = StructType(
             "event",
             "event_type",
             "source",
+            "employment_type",
+            "work_mode",
+            "description",
+            # Nested object captured as raw JSON text and parsed separately, so
+            # a malformed optional field can never reject an otherwise valid event.
+            "requirements",
             CORRUPT_COLUMN,
         )
     ]
 )
+REQUIREMENTS_SCHEMA = StructType([
+    StructField("skills", ArrayType(StringType()), True),
+    StructField("education", StringType(), True),
+])
 
 ISO_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"
 # Version of the window aggregation's state schema (v2 adds HLL distinct counts).
 WINDOW_STATE_VERSION = 2
+# Version of the per-category window aggregation's state schema.
+CATEGORY_STATE_VERSION = 1
 
 # Relative standard deviation of the HyperLogLog++ distinct counts per window.
 DISTINCT_RSD = 0.02
@@ -83,6 +110,11 @@ def parse_kafka_values(kafka_rows: DataFrame) -> DataFrame:
             F.col("topic").alias("kafka_topic"),
             F.col("partition").alias("kafka_partition"),
             F.col("offset").alias("kafka_offset"),
+            (
+                F.date_format(F.col("timestamp"), ISO_FORMAT)
+                if "timestamp" in kafka_rows.columns
+                else F.date_format(F.current_timestamp(), ISO_FORMAT)
+            ).alias("kafka_timestamp"),
         )
         .withColumn(
             "data",
@@ -111,6 +143,31 @@ def category_column(title) -> Any:
     return expression.otherwise(F.lit(DEFAULT_CATEGORY))
 
 
+def _canonical_column(column, mapping: Dict[str, str]) -> Any:
+    """Spark form of ``models._canonical``: letters-only lower-case key lookup."""
+    lookup = F.create_map(*[F.lit(item) for pair in mapping.items() for item in pair])
+    key = F.lower(F.regexp_replace(column, "[^A-Za-z]", ""))
+    return F.when(column.isNull(), F.lit(None)).otherwise(
+        F.coalesce(F.try_element_at(lookup, key), F.lit("Other"))
+    )
+
+
+def skills_column(declared, description) -> Any:
+    """Spark form of ``models.merge_skills``: aliases + skills found in free text."""
+    aliases = F.create_map(*[F.lit(item) for pair in SKILL_ALIASES.items() for item in pair])
+    normalized = F.transform(
+        F.coalesce(declared, F.array().cast("array<string>")),
+        lambda skill: F.lower(F.trim(F.regexp_replace(skill, r"\s+", " "))),
+    )
+    normalized = F.transform(normalized, lambda skill: F.coalesce(F.try_element_at(aliases, skill), skill))
+    normalized = F.filter(normalized, lambda skill: skill.isNotNull() & (skill != ""))
+    found = F.array_compact(F.array(*[
+        F.when(F.coalesce(description, F.lit("")).rlike(f"(?i){pattern}"), F.lit(skill))
+        for skill, pattern in SKILL_PATTERNS
+    ]))
+    return F.array_sort(F.array_distinct(F.concat(normalized, found)))
+
+
 def apply_etl(parsed: DataFrame) -> DataFrame:
     """Clean, validate and enrich parsed events.
 
@@ -132,6 +189,18 @@ def apply_etl(parsed: DataFrame) -> DataFrame:
         .withColumn("salary", F.col("salary_raw").try_cast("double"))
         .withColumn("event_time", F.col("timestamp").try_cast("timestamp"))
         .withColumn("category", category_column(F.col("title")))
+        .withColumn("employment_type", _canonical_column(_clean(data["employment_type"]), EMPLOYMENT_TYPES))
+        .withColumn(
+            "work_mode",
+            F.coalesce(
+                _canonical_column(_clean(data["work_mode"]), WORK_MODES),
+                F.when(F.lower(F.col("location")) == "remote", F.lit("Remote")),
+            ),
+        )
+        .withColumn("requirements_parsed", F.from_json(data["requirements"], REQUIREMENTS_SCHEMA))
+        .withColumn("education", _clean(F.col("requirements_parsed")["education"]))
+        .withColumn("skills", skills_column(F.col("requirements_parsed")["skills"], _clean(data["description"])))
+        .withColumn("skill_count", F.size("skills"))
     )
 
     missing = F.concat_ws(
@@ -152,7 +221,7 @@ def apply_etl(parsed: DataFrame) -> DataFrame:
         cleaned
         .withColumn("validation_error", error)
         .withColumn("event_time_iso", F.date_format("event_time", ISO_FORMAT))
-        .drop("data", "salary_raw")
+        .drop("data", "salary_raw", "requirements_parsed")
     )
 
 
@@ -192,10 +261,71 @@ def window_counts(
     )
 
 
+def category_window_metrics(
+    valid_events: DataFrame,
+    *,
+    watermark: str,
+    window: str,
+    slide: str,
+    distinct_rsd: float = DISTINCT_RSD,
+) -> DataFrame:
+    """Sliding-window hiring metrics per job category.
+
+    For each window: new postings, closures, all events, average advertised
+    salary (NEW and MODIFIED events) and active companies (HyperLogLog++).
+    """
+    event = F.col("event")
+    return (
+        valid_events
+        .withWatermark("event_time", watermark)
+        .groupBy(F.window("event_time", window, slide), F.col("category"))
+        .agg(
+            F.sum(F.when(event == "NEW", 1).otherwise(0)).alias("new_postings"),
+            F.sum(F.when(event == "CLOSED", 1).otherwise(0)).alias("closed_postings"),
+            F.count(F.lit(1)).alias("events"),
+            F.avg(F.when(event.isin("NEW", "MODIFIED"), F.col("salary"))).alias("avg_salary"),
+            F.approx_count_distinct("company", distinct_rsd).alias("active_companies"),
+        )
+        .select(
+            F.date_format("window.start", ISO_FORMAT).alias("window_start"),
+            F.date_format("window.end", ISO_FORMAT).alias("window_end"),
+            "category",
+            "new_postings",
+            "closed_postings",
+            "events",
+            "avg_salary",
+            "active_companies",
+        )
+    )
+
+
+def make_category_window_writer(
+    lake_root: str | Path,
+    sink: Optional[AlertSink] = None,
+    config: AlertConfig = AlertConfig(),
+) -> Callable[[DataFrame, int], None]:
+    """Upsert category window metrics, then evaluate hiring-surge alerts."""
+
+    def write(batch_df: DataFrame, _batch_id: int) -> None:
+        rows = [row.asDict() for row in batch_df.collect()]
+        if not rows:
+            return
+        parquet_store.merge_category_windows(rows, lake_root)
+        if sink is None:
+            return
+        history = parquet_store.read_dataset(lake_root, parquet_store.CATEGORY_WINDOW_DATASET).to_dict("records")
+        for alert in sink.publish(detect_surges(rows, history, config)):
+            print(f"ALERT {alert['alert_type']}: {alert['message']}", flush=True)
+
+    return write
+
+
 BATCH_COLUMNS = (
     "raw_value", "validation_error", "job_id", "company", "title", "location",
     "experience", "salary", "source", "timestamp", "event", "event_time_iso",
-    "category", "event_time", "kafka_topic", "kafka_partition", "kafka_offset",
+    "category", "event_time", "employment_type", "work_mode", "education",
+    "skills", "skill_count", "kafka_topic", "kafka_partition", "kafka_offset",
+    "kafka_timestamp",
 )
 
 
@@ -213,6 +343,11 @@ def row_to_record(row: Any) -> Dict[str, Any]:
         "event": row["event"],
         "event_time": event_time.isoformat() if event_time else None,
         "category": row["category"],
+        "employment_type": row["employment_type"],
+        "work_mode": row["work_mode"],
+        "education": row["education"],
+        "skills": list(row["skills"] or []),
+        "skill_count": row["skill_count"],
         # The Kafka position gives every event a replay-stable identity.
         "kafka_topic": row["kafka_topic"],
         "kafka_partition": row["kafka_partition"],
@@ -261,21 +396,35 @@ def process_partition_rows(
     received_at = datetime.now(timezone.utc).isoformat()
     valid: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
+    raw: List[Dict[str, Any]] = []
     for row in rows:
+        event_id = f"{row['kafka_topic']}-{row['kafka_partition']}-{row['kafka_offset']}"
+        raw.append({
+            "event_id": event_id,
+            "kafka_topic": row["kafka_topic"],
+            "kafka_partition": row["kafka_partition"],
+            "kafka_offset": row["kafka_offset"],
+            "kafka_timestamp": row["kafka_timestamp"],
+            "raw_value": row["raw_value"],
+            "received_at": received_at,
+        })
         if row["validation_error"] is None:
             valid.append(row_to_record(row))
         else:
             rejected.append({
+                "event_id": event_id,
                 "raw_value": row["raw_value"],
                 "validation_error": row["validation_error"],
                 "received_at": received_at,
             })
-    if not valid and not rejected:
+    if not raw:
         return
     for attempt in range(2):
         try:
             pipeline = StreamPipeline(_cached_store(hbase), lake_root, source=source)
-            summary = pipeline.process_partition(valid, batch_id, rejected=rejected, partition=index)
+            summary = pipeline.process_partition(
+                valid, batch_id, rejected=rejected, raw_records=raw, partition=index
+            )
         except Exception:
             # An idle Thrift connection may have been dropped. Retrying is safe
             # because every write in process_partition is idempotent.
@@ -307,6 +456,8 @@ def make_batch_processor(
     lake_root: str | Path,
     num_partitions: int,
     source: str | Callable[[], str] = "spark",
+    alert_sink: Optional[AlertSink] = None,
+    alert_config: AlertConfig = AlertConfig(),
 ) -> Callable[[DataFrame, int], None]:
     """Build the foreachBatch handler.
 
@@ -349,6 +500,9 @@ def make_batch_processor(
             f"detected={summary['detected']}{replay}",
             flush=True,
         )
+        if alert_sink is not None:
+            for alert in alert_sink.publish([data_quality_alert(summary, alert_config)]):
+                print(f"ALERT {alert['alert_type']}: {alert['message']}", flush=True)
 
     return process
 
@@ -379,9 +533,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--watermark", default="10 minutes")
     parser.add_argument("--window", default="5 minutes")
     parser.add_argument("--slide", default="1 minute")
+    parser.add_argument("--alerts-topic", default="job-alerts", help="Kafka topic for monitoring alerts.")
+    parser.add_argument("--alert-webhook", default=None, help="Optional webhook URL that receives each alert as JSON.")
+    parser.add_argument("--surge-ratio", type=float, default=AlertConfig.surge_ratio)
+    parser.add_argument("--max-rejection-rate", type=float, default=AlertConfig.max_rejection_rate)
     parser.add_argument("--hbase-mode", choices=["local", "thrift"], default="local")
     parser.add_argument("--hbase-host", default="localhost")
     parser.add_argument("--hbase-port", type=int, default=9090)
+    parser.add_argument("--hbase-table-prefix", default="", help="Prefix for HBase table names (isolates environments).")
     parser.add_argument("--hbase-path", default="data/hbase/careerpulse_hbase.sqlite3", help="Emulator file (local mode).")
     parser.add_argument("--parquet-output", default=None, help=argparse.SUPPRESS)  # legacy alias for --lake
     return parser
@@ -398,6 +557,7 @@ def main(argv: List[str] | None = None) -> None:
         "host": args.hbase_host,
         "port": args.hbase_port,
         "path": str(Path(args.hbase_path).resolve()),
+        "table_prefix": args.hbase_table_prefix,
         "retries": 12,
     }
 
@@ -405,6 +565,18 @@ def main(argv: List[str] | None = None) -> None:
         "CareerPulse Structured Streaming",
         args.master,
         packages=[kafka_connector_package()],
+    )
+    from src.streaming.kafka_producer import ensure_topics
+
+    # Spark's Kafka source fails on a missing topic, so create both topics
+    # first; this removes the start-up race with the first producer.
+    ensure_topics(args.bootstrap_servers, [args.topic, args.alerts_topic])
+    alert_config = AlertConfig(surge_ratio=args.surge_ratio, max_rejection_rate=args.max_rejection_rate)
+    alert_sink = AlertSink(
+        lake_root,
+        bootstrap_servers=args.bootstrap_servers,
+        topic=args.alerts_topic,
+        webhook_url=args.alert_webhook,
     )
     queries = []
     try:
@@ -434,6 +606,8 @@ def main(argv: List[str] | None = None) -> None:
                     lake_root=lake_root,
                     num_partitions=args.partitions or spark.sparkContext.defaultParallelism,
                     source=lambda: stream_label(checkpoint / "events"),
+                    alert_sink=alert_sink,
+                    alert_config=alert_config,
                 ))
                 .option("checkpointLocation", str(checkpoint / "events"))
             ).start()
@@ -451,6 +625,16 @@ def main(argv: List[str] | None = None) -> None:
                 # rebuilds its window state from Kafka instead of failing with
                 # STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE.
                 .option("checkpointLocation", str(checkpoint / f"windows-v{WINDOW_STATE_VERSION}"))
+            ).start()
+        )
+        queries.append(
+            trigger(
+                category_window_metrics(valid, watermark=args.watermark, window=args.window, slide=args.slide)
+                .writeStream
+                .queryName("careerpulse_category_windows")
+                .outputMode("update")
+                .foreachBatch(make_category_window_writer(lake_root, alert_sink, alert_config))
+                .option("checkpointLocation", str(checkpoint / f"category-v{CATEGORY_STATE_VERSION}"))
             ).start()
         )
 
@@ -471,6 +655,7 @@ def main(argv: List[str] | None = None) -> None:
         for query in queries:
             if query.isActive:
                 query.stop()
+        alert_sink.close()
         spark.stop()
         print("Spark Structured Streaming stopped.")
 

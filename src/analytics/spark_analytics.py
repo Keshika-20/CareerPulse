@@ -76,32 +76,75 @@ HIRING_TREND_QUERIES: Dict[str, str] = {
 }
 
 
-def load_events(spark, lake_root: str | Path):
-    """Load the processed event lake as a Spark DataFrame.
+# Queries over the semi-structured `skills` array and the standardised work
+# attributes; run only when the lake has those columns.
+SKILL_QUERIES: Dict[str, str] = {
+    "top_skills": """
+        SELECT skill, COUNT(*) AS new_postings
+        FROM job_events LATERAL VIEW explode(skills) exploded AS skill
+        WHERE event = 'NEW'
+        GROUP BY skill ORDER BY new_postings DESC, skill LIMIT 20
+    """,
+    "skills_by_category": """
+        SELECT category, skill, new_postings FROM (
+            SELECT category, skill, COUNT(*) AS new_postings,
+                   ROW_NUMBER() OVER (PARTITION BY category ORDER BY COUNT(*) DESC, skill) AS rank
+            FROM job_events LATERAL VIEW explode(skills) exploded AS skill
+            WHERE event = 'NEW'
+            GROUP BY category, skill
+        ) WHERE rank <= 5 ORDER BY category, new_postings DESC
+    """,
+    "avg_salary_by_skill": """
+        SELECT skill, ROUND(AVG(salary), 0) AS avg_salary, COUNT(salary) AS salary_samples
+        FROM job_events LATERAL VIEW explode(skills) exploded AS skill
+        WHERE event IN ('NEW', 'MODIFIED') AND salary IS NOT NULL
+        GROUP BY skill HAVING COUNT(salary) >= 5
+        ORDER BY avg_salary DESC LIMIT 15
+    """,
+    "work_mode_mix": """
+        SELECT COALESCE(work_mode, 'Unknown') AS work_mode,
+               COALESCE(employment_type, 'Unknown') AS employment_type,
+               COUNT(*) AS new_postings
+        FROM job_events WHERE event = 'NEW'
+        GROUP BY 1, 2 ORDER BY new_postings DESC
+    """,
+}
+
+
+def load_dataset(spark, lake_root: str | Path, dataset: str):
+    """Load a lake dataset as a Spark DataFrame (schemas merged across files).
 
     Spark reads the Parquet files directly when its local filesystem layer is
     usable. On Windows without winutils, files are read with pyarrow and handed
     to Spark through Arrow instead.
     """
-    files = parquet_store.dataset_files(lake_root, parquet_store.EVENTS_DATASET)
+    files = parquet_store.dataset_files(lake_root, dataset)
     if not files:
         raise FileNotFoundError(
-            f"No processed events under {Path(lake_root) / parquet_store.EVENTS_DATASET}. "
+            f"No data under {Path(lake_root) / dataset}. "
             "Run the streaming job or scripts/run_pipeline.py first."
         )
     if hadoop_filesystem_available():
-        return spark.read.parquet(*[str(path) for path in files])
-    spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-    frame = parquet_store.read_dataset(lake_root, parquet_store.EVENTS_DATASET)
-    return spark.createDataFrame(frame)
+        # Files written before a column existed are merged with nulls for it.
+        return spark.read.option("mergeSchema", "true").parquet(*[str(path) for path in files])
+    # Arrow keeps nested types (e.g. the skills list) that pandas would erase.
+    return spark.createDataFrame(parquet_store.read_arrow(lake_root, dataset))
+
+
+def load_events(spark, lake_root: str | Path):
+    """Load the processed event lake as a Spark DataFrame."""
+    return load_dataset(spark, lake_root, parquet_store.EVENTS_DATASET)
 
 
 def hiring_trends(spark, events_df, *, recent_minutes: int = 5) -> Dict[str, Any]:
     """Run every hiring-trend query with Spark SQL; returns name -> DataFrame."""
     events_df.createOrReplaceTempView(EVENTS_VIEW)
+    queries = dict(HIRING_TREND_QUERIES)
+    if {"skills", "work_mode", "employment_type"} <= set(events_df.columns):
+        queries.update(SKILL_QUERIES)
     return {
         name: spark.sql(query.format(recent_minutes=int(recent_minutes)))
-        for name, query in HIRING_TREND_QUERIES.items()
+        for name, query in queries.items()
     }
 
 

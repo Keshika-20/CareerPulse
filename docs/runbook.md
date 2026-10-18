@@ -28,9 +28,17 @@ python scripts/run_pipeline.py --count 3000 --backfill-hours 24 --invalid-rate 0
 What it does:
 
 1. The simulator writes 3,000 lifecycle events spread over the last 24 hours to `data/raw/job_events.jsonl`, about 3% of them malformed.
-2. Events go through `StreamPipeline` in micro-batches. This is the same code the Spark job calls in `foreachBatch`: validation, change detection against HBase, HBase writes and Parquet lake appends.
-3. It prints DuckDB KPIs over `data/lake`.
-4. `--spark` runs Spark SQL, RDD and MLlib analytics into `data/lake/analytics`.
+2. A hiring surge for Data Engineer is injected at 90–95% of the time span (`--surge-title ""` disables it).
+3. Events go through `StreamPipeline` in micro-batches. This is the same code the Spark job calls in `foreachBatch`: raw archive, validation, change detection against HBase, HBase writes and Parquet lake appends.
+4. Per-category sliding windows are computed, and hiring-surge and data-quality alerts are printed and written to `data/lake/alerts`.
+5. It prints DuckDB KPIs over `data/lake`.
+6. `--spark` runs Spark SQL, RDD, MLlib and the cold-storage batch job into `data/lake/analytics`.
+
+Then reconcile the run:
+
+```powershell
+python scripts/verify_pipeline.py --lake data/lake
+```
 
 HBase defaults to the embedded emulator in `data/hbase/careerpulse_hbase.sqlite3`. Pass `--hbase-mode thrift` to use a real HBase.
 
@@ -44,13 +52,18 @@ This starts:
 
 - `kafka`: KRaft broker. Host clients use `localhost:9092`; containers use `kafka:29092`.
 - `hbase`: HBase 2.1 with Thrift on `localhost:9090` and the master UI at http://localhost:16010. If those host ports are taken (Prometheus also uses 9090), set `CAREERPULSE_HBASE_THRIFT_PORT` / `CAREERPULSE_HBASE_UI_PORT` before `up`, and point host clients at the new port with `CAREERPULSE_HBASE_PORT`.
-- `spark-streaming`: the Structured Streaming job with 10-second micro-batches, writing to HBase over Thrift and to `./data/lake` (bind-mounted). On its first start it downloads the Spark Kafka connector into a cached volume.
+- `spark-streaming`: the Structured Streaming job with 10-second micro-batches, writing to HBase over Thrift and to `./data/lake` (bind-mounted). It creates the `job-events` and `job-alerts` topics if missing. On its first start it downloads the Spark Kafka connector into a cached volume.
+- `alert-consumer`: a real-time app that prints every alert from `job-alerts`.
 
 Produce events from the host:
 
 ```powershell
-# 24 h of history, then a live stream of 5 events/s, with 3% malformed records
-python -m src.streaming.kafka_producer --backfill-hours 24 --count 3000 --stream --rate 5 --invalid-rate 0.03
+# 2 h of history with a Data Engineer surge near the end, then a live stream of 10 events/s
+python -m src.streaming.kafka_producer --backfill-hours 2 --count 6000 --surge-title "Data Engineer" --stream --rate 10 --invalid-rate 0.03
+# a live surge: starts after 60 s, lasts 120 s (watch for HIRING_SURGE)
+python -m src.streaming.kafka_producer --stream --rate 20 --duration 300 --surge-title "Machine Learning Engineer"
+# a burst of malformed data (watch for DATA_QUALITY)
+python -m src.streaming.kafka_producer --stream --rate 20 --duration 20 --invalid-rate 0.35
 # or real public-board listings
 python -m src.ingestion.service --config .\data\ingestion.local.json --kafka
 ```
@@ -58,8 +71,21 @@ python -m src.ingestion.service --config .\data\ingestion.local.json --kafka
 Watch the job:
 
 ```powershell
-docker logs -f careerpulse-spark-streaming   # "Batch N: processed=... rejected=... detected={...}"
+docker logs -f careerpulse-spark-streaming   # "Batch N: processed=... rejected=... detected={...}" and "ALERT ..."
+docker logs -f careerpulse-alert-consumer    # alerts as a downstream app receives them
+# or on the host:
+python -m src.streaming.alert_consumer --bootstrap-servers localhost:9092 --from-beginning
 ```
+
+To trigger workflows, pass a webhook to the job. It POSTs `{"text": message, "alert": {...}}`, the format Slack and Teams incoming webhooks accept: add `--alert-webhook=https://...` to the `spark-streaming` command in `compose.yaml`. Thresholds are set with `--surge-ratio` and `--max-rejection-rate`.
+
+Verify the run end to end (use the host port you mapped for Thrift):
+
+```powershell
+python scripts/verify_pipeline.py --kafka localhost:9092 --hbase-mode thrift --hbase-port 9090
+```
+
+It expects a lake created from a clean start. Data written before the raw archive existed can't be reconciled, so reset first with `docker compose --profile pipeline down -v` and `Remove-Item -Recurse data\lake`.
 
 Run the batch analytics:
 
@@ -85,6 +111,8 @@ Useful flags:
 - `--trigger-seconds`
 - `--watermark`, `--window`, `--slide`
 - `--hbase-mode thrift --hbase-host localhost`
+- `--hbase-table-prefix demo_`: isolated HBase tables, e.g. for a separate test run
+- `--alerts-topic`, `--alert-webhook`, `--surge-ratio`, `--max-rejection-rate`
 
 ## 3. Dashboard
 
@@ -140,6 +168,7 @@ python -m pytest -q
 - `test_spark_jobs.py`: Spark ETL parity with the Python rules, the `foreachBatch` handler, window logic, Spark SQL, RDD, and MLlib.
 - `test_streaming.py`: Spark batch aggregation.
 - `test_near_duplicates.py`: open-posting state, MinHash LSH pairs vs an exact all-pairs Jaccard scan, and the run_analytics output table.
+- `test_alerts_and_cold_storage.py`: enrichment and standardisation, simulator surges, category windows, surge and data-quality detection, alert de-duplication and webhook delivery, raw archive, and `verify_pipeline` (including detecting a duplicate and a missing Kafka offset).
 - Concurrency and fault tolerance: `test_counter_increments_are_atomic_across_processes` (4 OS processes on one counter), `test_replaying_a_batch_is_idempotent`, `test_parallel_partitions_match_sequential_processing`, and the replay check in `test_foreach_batch_handler_runs_change_detection_and_storage`.
 
 Both start a local Spark session (Java required) but use in-memory DataFrames. Everything else is pure Python.

@@ -112,6 +112,34 @@ def _render_live(st, pd, queries: LakeQueries, lake: Path) -> None:
             f"latest event time {_fmt(kpis.get('latest_event'))} UTC"
         )
 
+    alerts = queries.alerts(20)
+    st.markdown("### Alerts · monitoring & notification")
+    if alerts:
+        critical = sum(1 for alert in alerts if alert["severity"] == "critical")
+        st.caption(
+            f"{len(alerts)} most recent alerts ({critical} critical). Also published to the `job-alerts` Kafka "
+            "topic (tail it with `python -m src.streaming.alert_consumer`) and to the optional webhook."
+        )
+        for alert in alerts[:3]:
+            show = st.error if alert["severity"] == "critical" else st.warning
+            show(f"**{alert['alert_type']}** · {alert['message']} · {_fmt(alert['window_start'] or alert['created_at'])} UTC")
+        st.dataframe(
+            [{
+                "Raised (UTC)": _fmt(alert["created_at"]),
+                "Type": alert["alert_type"],
+                "Severity": alert["severity"],
+                "Subject": alert["subject"],
+                "Observed": alert["observed"],
+                "Threshold": alert["threshold"],
+                "Baseline": alert["baseline"],
+                "Message": alert["message"],
+            } for alert in alerts],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.success("No alerts: no hiring surges or data-quality problems detected.")
+
     st.markdown("### Live event feed")
     recent = queries.recent_events(40)
     st.dataframe(
@@ -145,6 +173,31 @@ def _render_live(st, pd, queries: LakeQueries, lake: Path) -> None:
     else:
         st.info("Window aggregates appear once the Structured Streaming job has emitted windows.")
 
+    st.markdown("### Category metrics · last 5 minutes")
+    latest = queries.latest_category_window()
+    if latest:
+        st.caption(
+            f"Sliding window {_fmt(latest[0]['window_start'])}–{_fmt(latest[0]['window_end'])[11:]} UTC: "
+            "new postings, closures, average advertised salary and active companies per category."
+        )
+        st.dataframe(
+            [{
+                "Category": row["category"],
+                "New postings": row["new_postings"],
+                "Closed": row["closed_postings"],
+                "Events": row["events"],
+                "Avg salary": row["avg_salary"],
+                "Active companies": row["active_companies"],
+            } for row in latest],
+            use_container_width=True,
+            hide_index=True,
+        )
+        category_chart = pivot(queries.category_windows(), "window_start", "category", "new_postings")
+        if category_chart is not None:
+            st.line_chart(category_chart)
+    else:
+        st.info("Category window metrics appear once windows have been computed.")
+
     left, right = st.columns(2)
     with left:
         st.markdown("#### Top companies by new postings")
@@ -157,6 +210,20 @@ def _render_live(st, pd, queries: LakeQueries, lake: Path) -> None:
         if salary:
             st.bar_chart(pd.DataFrame(salary).set_index("category")[["avg_salary"]])
 
+    skills = queries.top_skills(15)
+    modes = queries.work_mode_mix()
+    if skills or modes:
+        left, right = st.columns([1.4, 1])
+        with left:
+            st.markdown("#### Most requested skills")
+            st.caption("Declared skills plus skills extracted from free-text descriptions.")
+            if skills:
+                st.bar_chart(pd.DataFrame(skills).set_index("skill"))
+        with right:
+            st.markdown("#### Work mode of new postings")
+            if modes:
+                st.bar_chart(pd.DataFrame(modes).set_index("work_mode"))
+
     st.markdown("### Hiring trends")
     dim_col, bucket_col = st.columns(2)
     dimension = dim_col.selectbox("Dimension", ["category", "company", "location"], key="cp_trend_dim")
@@ -166,6 +233,11 @@ def _render_live(st, pd, queries: LakeQueries, lake: Path) -> None:
         st.line_chart(trend)
     st.dataframe(queries.breakdown(dimension), use_container_width=True, hide_index=True)
 
+    archive = queries.raw_archive_stats()
+    st.caption(
+        f"Cold storage: {archive['messages']:,} raw messages archived in {archive['files']:,} Parquet files "
+        f"(every message as received, valid or not)."
+    )
     quarantine = queries.quarantine_summary()
     with st.expander(f"Validation quarantine · {sum(row['records'] for row in quarantine):,} rejected records"):
         if quarantine:
@@ -221,9 +293,16 @@ def _render_spark_outputs(st, pd, queries: LakeQueries) -> None:
         if pairs:
             st.dataframe(pairs, use_container_width=True, hide_index=True)
 
+    quality = queries.analytics_table("data_quality_daily")
+    if quality:
+        st.markdown("#### Data quality by day · batch job over the raw archive")
+        st.caption("The cold-storage archive replayed through the same Spark ETL rules as the stream.")
+        st.dataframe(quality, use_container_width=True, hide_index=True)
+
     with st.expander("Spark SQL hiring-trend tables"):
         for name in ("event_counts", "recent_new_jobs", "top_companies_new", "avg_salary_by_category",
-                     "modified_closed_by_company", "hiring_by_category_location"):
+                     "modified_closed_by_company", "hiring_by_category_location", "top_skills",
+                     "skills_by_category", "avg_salary_by_skill", "work_mode_mix"):
             st.markdown(f"**{name}**")
             st.dataframe(queries.analytics_table(name), use_container_width=True, hide_index=True)
 

@@ -2,9 +2,12 @@
 
 Layout under the lake root::
 
+    raw/event_date=YYYY-MM-DD/part-*.parquet          cold storage: every incoming message, as received
     events/event_date=YYYY-MM-DD/part-*.parquet       processed, change-detected events
     quarantine/event_date=YYYY-MM-DD/part-*.parquet   records rejected by validation
-    window_counts/window_counts.parquet               streaming window aggregates
+    window_counts/window_counts.parquet               streaming window aggregates per event type
+    window_category/window_category.parquet           streaming window metrics per job category
+    alerts/event_date=YYYY-MM-DD/part-*.parquet       monitoring alerts (surges, data quality)
     analytics/*.parquet                               Spark SQL / RDD / ML outputs
 
 Files are written to a hidden temporary name and atomically renamed, so readers
@@ -33,9 +36,12 @@ except ImportError:  # pragma: no cover
     pa = None
     pq = None
 
+RAW_DATASET = "raw"
 EVENTS_DATASET = "events"
 QUARANTINE_DATASET = "quarantine"
 WINDOW_DATASET = "window_counts"
+CATEGORY_WINDOW_DATASET = "window_category"
+ALERTS_DATASET = "alerts"
 ANALYTICS_DATASET = "analytics"
 
 
@@ -67,6 +73,56 @@ def events_schema():
         ("fingerprint", pa.string()),
         ("event_time", _ts_type()),
         ("processed_at", _ts_type()),
+        # Optional, higher-dimensional attributes (null in older files).
+        ("employment_type", pa.string()),
+        ("work_mode", pa.string()),
+        ("education", pa.string()),
+        ("skills", pa.list_(pa.string())),
+        ("skill_count", pa.int64()),
+    ])
+
+
+def raw_schema():
+    _require_pyarrow()
+    return pa.schema([
+        ("event_id", pa.string()),
+        ("kafka_topic", pa.string()),
+        ("kafka_partition", pa.int64()),
+        ("kafka_offset", pa.int64()),
+        ("kafka_timestamp", _ts_type()),
+        ("raw_value", pa.string()),
+        ("received_at", _ts_type()),
+    ])
+
+
+def category_window_schema():
+    _require_pyarrow()
+    return pa.schema([
+        ("window_start", _ts_type()),
+        ("window_end", _ts_type()),
+        ("category", pa.string()),
+        ("new_postings", pa.int64()),
+        ("closed_postings", pa.int64()),
+        ("events", pa.int64()),
+        ("avg_salary", pa.float64()),
+        ("active_companies", pa.int64()),
+    ])
+
+
+def alerts_schema():
+    _require_pyarrow()
+    return pa.schema([
+        ("alert_id", pa.string()),
+        ("alert_type", pa.string()),
+        ("severity", pa.string()),
+        ("subject", pa.string()),
+        ("message", pa.string()),
+        ("observed", pa.float64()),
+        ("threshold", pa.float64()),
+        ("baseline", pa.float64()),
+        ("window_start", _ts_type()),
+        ("window_end", _ts_type()),
+        ("created_at", _ts_type()),
     ])
 
 
@@ -74,6 +130,7 @@ def quarantine_schema():
     _require_pyarrow()
     return pa.schema([
         ("batch_id", pa.int64()),
+        ("event_id", pa.string()),
         ("raw_value", pa.string()),
         ("validation_error", pa.string()),
         ("received_at", _ts_type()),
@@ -193,21 +250,54 @@ def append_quarantine(records: Iterable[Dict[str, Any]], lake_root: str | Path, 
     )
 
 
-def merge_window_counts(records: Iterable[Dict[str, Any]], lake_root: str | Path) -> int:
-    """Upsert streaming window aggregates keyed by (window_start, window_end, event)."""
-    _require_pyarrow()
-    target = Path(lake_root) / WINDOW_DATASET / "window_counts.parquet"
+def append_raw(records: Iterable[Dict[str, Any]], lake_root: str | Path, *, label: str = "") -> int:
+    """Archive incoming messages unchanged (cold storage), partitioned by Kafka time.
+
+    Partitioning by the broker timestamp (not the processing time) keeps a
+    replayed batch's archive file in the same directory, so it is overwritten.
+    """
+    return append_partitioned(
+        records, lake_root, RAW_DATASET, raw_schema(), time_field="kafka_timestamp", label=label
+    )
+
+
+def append_alerts(records: Iterable[Dict[str, Any]], lake_root: str | Path, *, label: str = "") -> int:
+    return append_partitioned(
+        records, lake_root, ALERTS_DATASET, alerts_schema(), time_field="created_at", label=label
+    )
+
+
+def _merge_keyed(records: Iterable[Dict[str, Any]], target: Path, schema, keys: tuple) -> int:
+    """Upsert rows into a single small Parquet file (single writer per file)."""
     merged: Dict[tuple, Dict[str, Any]] = {}
     if target.exists():
         for row in pq.read_table(target).to_pylist():
-            merged[(row["window_start"], row["window_end"], row["event"])] = row
-    for row in _rows_for_schema(records, window_schema()):
-        merged[(row["window_start"], row["window_end"], row["event"])] = row
+            merged[tuple(row.get(key) for key in keys)] = row
+    for row in _rows_for_schema(records, schema):
+        merged[tuple(row[key] for key in keys)] = row
     if not merged:
         return 0
-    ordered = sorted(merged.values(), key=lambda row: (row["window_start"], row["event"]))
-    _atomic_write_table(pa.Table.from_pylist(ordered, schema=window_schema()), target)
+    ordered = sorted(merged.values(), key=lambda row: tuple(str(row.get(key)) for key in keys))
+    _atomic_write_table(pa.Table.from_pylist(ordered, schema=schema), target)
     return len(ordered)
+
+
+def merge_window_counts(records: Iterable[Dict[str, Any]], lake_root: str | Path) -> int:
+    """Upsert streaming window aggregates keyed by (window_start, window_end, event)."""
+    _require_pyarrow()
+    return _merge_keyed(
+        records, Path(lake_root) / WINDOW_DATASET / "window_counts.parquet", window_schema(),
+        ("window_start", "window_end", "event"),
+    )
+
+
+def merge_category_windows(records: Iterable[Dict[str, Any]], lake_root: str | Path) -> int:
+    """Upsert per-category window metrics keyed by (window_start, window_end, category)."""
+    _require_pyarrow()
+    return _merge_keyed(
+        records, Path(lake_root) / CATEGORY_WINDOW_DATASET / "window_category.parquet",
+        category_window_schema(), ("window_start", "window_end", "category"),
+    )
 
 
 def write_analytics_table(records: List[Dict[str, Any]], lake_root: str | Path, name: str) -> Path:
@@ -225,13 +315,25 @@ def dataset_files(lake_root: str | Path, dataset: str) -> List[Path]:
     return sorted(path for path in root.rglob("*.parquet") if not path.name.startswith("."))
 
 
+def read_arrow(lake_root: str | Path, dataset: str = EVENTS_DATASET):
+    """Read a lake dataset as one pyarrow Table (schemas promoted across files)."""
+    _require_pyarrow()
+    files = dataset_files(lake_root, dataset)
+    if not files:
+        return None
+    return pa.concat_tables([pq.read_table(path) for path in files], promote_options="default")
+
+
 def read_dataset(lake_root: str | Path, dataset: str = EVENTS_DATASET):
     """Read a lake dataset into pandas (empty frame with the schema if missing)."""
     _require_pyarrow()
     schemas = {
+        RAW_DATASET: raw_schema(),
         EVENTS_DATASET: events_schema(),
         QUARANTINE_DATASET: quarantine_schema(),
         WINDOW_DATASET: window_schema(),
+        CATEGORY_WINDOW_DATASET: category_window_schema(),
+        ALERTS_DATASET: alerts_schema(),
     }
     files = dataset_files(lake_root, dataset)
     if not files:

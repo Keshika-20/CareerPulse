@@ -54,6 +54,121 @@ def derive_category(title: Any) -> str:
     return DEFAULT_CATEGORY
 
 
+# Skills recognised in free-text job descriptions (canonical name -> pattern).
+# Like CATEGORY_RULES, the patterns must work in both Python and Java regex.
+SKILL_PATTERNS = (
+    ("python", r"\bpython\b"),
+    ("java", r"\bjava\b"),
+    ("scala", r"\bscala\b"),
+    ("sql", r"\bsql\b"),
+    ("spark", r"\b(apache )?spark\b"),
+    ("kafka", r"\bkafka\b"),
+    ("hadoop", r"\bhadoop\b"),
+    ("airflow", r"\bairflow\b"),
+    ("aws", r"\b(aws|amazon web services)\b"),
+    ("azure", r"\bazure\b"),
+    ("gcp", r"\b(gcp|google cloud)\b"),
+    ("docker", r"\bdocker\b"),
+    ("kubernetes", r"\b(kubernetes|k8s)\b"),
+    ("terraform", r"\bterraform\b"),
+    ("linux", r"\blinux\b"),
+    ("javascript", r"\bjavascript\b"),
+    ("typescript", r"\btypescript\b"),
+    ("react", r"\breact\b"),
+    ("node.js", r"\bnode(\.js)?\b"),
+    ("go", r"\b(golang|go lang)\b"),
+    ("machine learning", r"\bmachine learning\b"),
+    ("pytorch", r"\bpytorch\b"),
+    ("tensorflow", r"\btensorflow\b"),
+    ("nlp", r"\bnlp\b"),
+    ("tableau", r"\btableau\b"),
+    ("power bi", r"\bpower ?bi\b"),
+    ("excel", r"\bexcel\b"),
+    ("selenium", r"\bselenium\b"),
+    ("figma", r"\bfigma\b"),
+    ("ci/cd", r"\bci/cd\b"),
+)
+SKILL_ALIASES = {
+    "py": "python",
+    "k8s": "kubernetes",
+    "js": "javascript",
+    "ts": "typescript",
+    "node": "node.js",
+    "nodejs": "node.js",
+    "golang": "go",
+    "ml": "machine learning",
+    "powerbi": "power bi",
+    "amazon web services": "aws",
+    "google cloud": "gcp",
+    "apache spark": "spark",
+    "pyspark": "spark",
+}
+EMPLOYMENT_TYPES = {
+    "fulltime": "Full-time",
+    "ft": "Full-time",
+    "permanent": "Full-time",
+    "parttime": "Part-time",
+    "pt": "Part-time",
+    "contract": "Contract",
+    "contractor": "Contract",
+    "temporary": "Contract",
+    "intern": "Internship",
+    "internship": "Internship",
+}
+WORK_MODES = {
+    "remote": "Remote",
+    "wfh": "Remote",
+    "workfromhome": "Remote",
+    "hybrid": "Hybrid",
+    "onsite": "Onsite",
+    "inoffice": "Onsite",
+    "office": "Onsite",
+}
+_COMPILED_SKILLS = tuple((skill, re.compile(pattern, re.IGNORECASE)) for skill, pattern in SKILL_PATTERNS)
+_LETTERS_ONLY = re.compile(r"[^a-z]")
+
+
+def _canonical(value: Any, mapping: Dict[str, str]) -> Optional[str]:
+    if value is None or not str(value).strip():
+        return None
+    return mapping.get(_LETTERS_ONLY.sub("", str(value).lower()), "Other")
+
+
+def standardize_employment_type(value: Any) -> Optional[str]:
+    return _canonical(value, EMPLOYMENT_TYPES)
+
+
+def standardize_work_mode(value: Any, location: Any = None) -> Optional[str]:
+    mode = _canonical(value, WORK_MODES)
+    if mode is None and str(location or "").strip().lower() == "remote":
+        return "Remote"
+    return mode
+
+
+def normalize_skill(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    # str(True).lower() == "true", matching Spark's string coercion of JSON booleans.
+    text = re.sub(r"\s+", " ", str(value)).strip().lower()
+    if not text:
+        return None
+    return SKILL_ALIASES.get(text, text)
+
+
+def extract_skills(description: Any) -> list:
+    """Canonical skills mentioned in unstructured description text."""
+    text = str(description or "")
+    return [skill for skill, pattern in _COMPILED_SKILLS if pattern.search(text)]
+
+
+def merge_skills(declared: Any, description: Any) -> list:
+    """Declared skills (normalised, aliases resolved) plus skills found in the text."""
+    declared_list = declared if isinstance(declared, list) else []
+    skills = {skill for skill in (normalize_skill(item) for item in declared_list) if skill}
+    skills.update(extract_skills(description))
+    return sorted(skills)
+
+
 def job_fingerprint(record: Dict[str, Any]) -> str:
     """Stable hash of the tracked job details, used to spot duplicate postings."""
     values = {field: record.get(field) for field in TRACKED_FIELDS}

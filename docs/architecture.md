@@ -1,27 +1,30 @@
 # CareerPulse Architecture
 
-CareerPulse processes a continuous stream of job-posting events. It classifies each event against the job's stored state, keeps an operational history in HBase and an analytical history in Parquet, and serves hiring-trend analytics, a trending-company ranking and a demand forecast through Streamlit.
+CareerPulse processes a continuous stream of job-posting events. It classifies each event against the job's stored state, archives every raw message, keeps an operational history in HBase and an analytical history in Parquet, raises hiring-surge and data-quality alerts, and serves hiring-trend analytics, a trending-company ranking and a demand forecast through Streamlit. [requirements-coverage.md](./requirements-coverage.md) maps each course requirement to this design.
 
 ## 1. End-to-end flow
 
 ```text
- Sources                      Transport             Processing                         Storage                     Analytics / serving
- ───────                      ─────────             ──────────                         ───────                     ───────────────────
+ Sources                      Ingest                Stream processing                  Storage / outputs
+ ───────                      ──────                ─────────────────                  ─────────────────
  JobEventSimulator  ─┐
-  (stateful, demand  │                      Spark Structured Streaming
-   cycles, malformed ├─► Kafka job-events ─► 1 parse JSON (all fields as strings)
-   records)          │   key = job_id        2 validate: malformed / missing / event /
- Public boards ──────┘   3 partitions          salary / timestamp → validation_error
-  ingestion --kafka                          3 clean whitespace, normalise event, cast
-  (SQLite outbox)                            4 enrich: title → category
-                                             5a foreachBatch ───────────────────────► HBase job_history, company_stats
-                                                 change detection vs HBase           Parquet events/ (by event_date)
-                                                                                     Parquet quarantine/
-                                             5b watermark + sliding window ─────────► Parquet window_counts/
-                                                                                              │
-                                                     Spark SQL trends · RDD top-k · MLlib ◄───┘ ─► Parquet analytics/
-                                                                                              │
-                                                                     DuckDB over Parquet ─► Streamlit
+  (lifecycles, nested│                      Spark Structured Streaming
+   requirements, free├─► Kafka job-events ─► 1 parse JSON (fields as strings; nested object isolated)
+   text, surges)     │   key = job_id        2 validate → validation_error code
+ Public boards ──────┘   3 partitions        3 standardise: whitespace, case, UTC, employment type, work mode
+  ingestion --kafka                          4 enrich: title → category; skills = declared + found in text
+  (SQLite outbox)                            5a foreachBatch, repartitioned by job_id, in parallel:
+                                                 raw archive ─────────────────────────► Parquet raw/ (cold storage)
+                                                 change detection vs HBase ───────────► HBase job_history, company_stats
+                                                                                        Parquet events/, quarantine/
+                                                 rejection rate ──► data-quality alert ┐
+                                             5b sliding windows per event type ───────► Parquet window_counts/
+                                             5c sliding windows per category ─────────► Parquet window_category/
+                                                 surge detection ──► hiring-surge alert┤
+                                                                                       ▼
+                                                     alerts/ + Kafka job-alerts + webhook ──► alert_consumer
+ Batch: raw/ ──► same Spark ETL ──► data-quality report ─┐
+        events/ ──► Spark SQL · RDD top-k · MLlib ───────┴──► Parquet analytics/ ──► DuckDB ──► Streamlit
 ```
 
 ## 2. Event model
@@ -34,6 +37,16 @@ Producer payload (semi-structured JSON):
 ```
 
 `experience` and `salary` may be null (public boards often omit them). `event_type` is accepted as an alias of `event`. Public-board events also carry `source` and salary-range fields, which are ignored downstream.
+
+Simulated postings add optional, higher-dimensional attributes, deliberately messy so that standardisation has real work to do:
+
+```json
+{"employment_type": "full time", "work_mode": "WFH",
+ "requirements": {"skills": ["PySpark", "py", "SQL"], "education": "B.Tech"},
+ "description": "Build pipelines on Kafka and Apache Spark; Airflow is a plus."}
+```
+
+These never cause a rejection. After ETL they become `employment_type` (`Full-time`), `work_mode` (`Remote`), `education`, `skills` (`["airflow", "kafka", "python", "spark", "sql"]`) and `skill_count`.
 
 The producer's `event` field is a claim. Apart from `CLOSED`, it is overridden by change detection.
 
@@ -59,7 +72,13 @@ Every JSON field is parsed as a string, so type errors become explicit validatio
 | `invalid_salary` | present but not a finite non-negative number (`try_cast`, ANSI-safe) |
 | `invalid_timestamp` | not parseable as a timestamp |
 
-Cleaning collapses whitespace, trims text, uppercases the event and casts salary and event time. Enrichment derives `category` from the title with ordered regex rules (`CATEGORY_RULES` in `src/common/models.py`), which compile both to Python `re` and to Spark `rlike`.
+Cleaning collapses whitespace, trims text, uppercases the event and casts salary and event time.
+
+Standardisation maps employment-type and work-mode spellings to canonical values with a letters-only key (`FT`/`full time` → `Full-time`, `on-site` → `Onsite`, `WFH` → `Remote`; unknown → `Other`). A posting located in "Remote" with no work mode is inferred as `Remote`.
+
+Enrichment derives `category` from the title with ordered regex rules (`CATEGORY_RULES`). It also builds `skills`: declared skills are lower-cased and alias-resolved (`SKILL_ALIASES`: `py` → python, `k8s` → kubernetes), unioned with skills recognised in the unstructured description (`SKILL_PATTERNS`), then de-duplicated and sorted. All rules live in `src/common/models.py`, and the patterns compile both to Python `re` and to Spark `rlike`.
+
+`requirements` is captured as raw JSON text and parsed in a second, isolated `from_json`. A malformed optional object then only nulls that field instead of making Spark flag the whole record as corrupt.
 
 `src/streaming/etl.py` implements the same rules in Python for the local runner. `tests/test_spark_jobs.py::test_spark_etl_matches_python_rules` checks the two stay identical.
 
@@ -78,9 +97,21 @@ detect_change(previous_state, record):
 
 Each partition multi-gets the state and applied-event ledger of all its jobs in one HBase call, keeps state current in memory (so several events for one job in a batch see each other), then writes all mutations in bulk. Rejected rows go to the quarantine dataset with their raw payload and error code. Each Python worker reuses one HBase connection across tasks and batches. If an idle Thrift connection has dropped, the partition reconnects and retries, which is safe because every write is idempotent.
 
-### Streaming windows
+### Streaming windows and alerts
 
 Valid events are watermarked on event time (default 10 minutes) and aggregated per claimed event type over 5-minute windows sliding every minute, in update mode. Each window row has the event `count` plus `unique_jobs` and `unique_companies`. Exact `countDistinct` is not supported in streaming aggregations, so the distinct counts use HyperLogLog++ (`approx_count_distinct`, 2% relative standard deviation, `DISTINCT_RSD`). Its state per window is a fixed-size sketch, whatever the event volume. Results are upserted into `window_counts/window_counts.parquet`. Window files written before the distinct columns existed still read, with nulls in those columns.
+
+A third query aggregates per **category** over the same sliding windows: new postings, closures, all events, average advertised salary (NEW and MODIFIED) and active companies (HLL). This is the job-market counterpart of the brief's "active rides and average fare per neighbourhood in the last 5 minutes". Rows are upserted into `window_category/window_category.parquet`, with state versioned like the other window query (`category-v<N>` checkpoint).
+
+**Monitoring and notification** (`src/streaming/alerts.py`):
+
+- *Hiring surge*: after each category-window update, every window aligned to 5 minutes is compared with that category's previous 12 aligned windows. It alerts when the observed count is at least `max(5, 2 × mean, mean + 3σ)`, with σ² floored at the mean (Poisson), so quiet categories don't flag blips.
+- *Data quality*: a micro-batch with more than 20% of at least 20 records rejected raises an alert.
+- Alert IDs are deterministic (`surge:<category>:<window>`, `quality:<source>:<batch>`), so updates and replays never re-fire an alert.
+- New alerts are appended to `alerts/`, published to the `job-alerts` Kafka topic (keyed by alert ID), and POSTed to an optional webhook (Slack-style `{"text": ...}`) to trigger workflows. Delivery failures are logged and never stop the pipeline.
+- `src/streaming/alert_consumer.py` is the real-time app on the other end of the topic.
+
+The job creates its Kafka topics before subscribing (`ensure_topics`). Spark's Kafka source fails on a missing topic, so a consumer started before the first producer would otherwise crash.
 
 ## 5. HBase data model (`src/storage/hbase_store.py`)
 
@@ -115,12 +146,17 @@ Wide-column design notes:
 
 ```text
 data/lake/
+  raw/event_date=YYYY-MM-DD/part-<source>-b<batch>-p<partition>.parquet      cold storage: every message as received
   events/event_date=YYYY-MM-DD/part-<source>-b<batch>-p<partition>.parquet   processed events
   quarantine/event_date=YYYY-MM-DD/...                      rejected raw payloads + error code
-  window_counts/window_counts.parquet                       streaming window aggregates
+  window_counts/window_counts.parquet                       window aggregates per event type
+  window_category/window_category.parquet                   window metrics per category
+  alerts/event_date=YYYY-MM-DD/...                          monitoring alerts
   analytics/*.parquet, summary.json                         Spark SQL / RDD / ML outputs
   _status/pipeline_status.json                              last batch + running totals
 ```
+
+The raw archive stores the payload, its Kafka topic, partition, offset and broker timestamp. It is partitioned by broker time, not processing time, so a replayed batch lands in the same file. Every raw, processed and quarantined row carries the same `event_id`, which is what makes end-to-end reconciliation possible.
 
 Schemas are explicit, so all-null columns keep their types. Each file is written to a hidden temporary name and atomically renamed, so concurrent DuckDB readers never see partial files. On Windows the rename retries briefly if a reader holds the target open. File names are deterministic per (source, batch, partition), so a replayed batch overwrites its own files instead of appending duplicates. The streaming source label includes the query ID from the checkpoint, so a new checkpoint never overwrites an old query's files. Hive-style `event_date` directories allow partition pruning.
 
@@ -145,6 +181,8 @@ Schemas are explicit, so all-null columns keep their types. Each file is written
   - Takes the latest state of every open job (DUPLICATE events ignored, jobs whose latest event is CLOSED dropped). It normalises company, title, location and experience (lower-case, punctuation stripped, `sr`/`jr`/`eng`/`mgr`/`dev`/`ml` expanded) into character 3-gram shingles, hashed into a binary `HashingTF` vector.
   - Comparing every pair is O(n²). Instead, MinHash LSH with 5 hash tables only compares postings that collide in at least one table. A pair with Jaccard similarity s becomes a candidate with probability 1 − (1 − s)^5 (0.9997 at s = 0.8). Every candidate's exact Jaccard distance is computed, so reported pairs are never false positives.
   - Reports pairs with similarity ≥ 0.85 (`--near-duplicate-similarity`), with a `same_source` flag for cross-source re-posts (Greenhouse vs Lever). The 0.85 default excludes postings that differ only in experience band, which score about 0.8. Writes up to 500 pairs to `analytics/near_duplicate_postings.parquet`; totals go in `summary.json` under `near_duplicates`. Skip it with `--skip-near-duplicates`.
+- **Skills and work attributes** (Spark SQL over the semi-structured array): most requested skills (`LATERAL VIEW explode`), top skills per category (`ROW_NUMBER`), average salary by skill, work-mode × employment-type mix.
+- **Batch job over cold storage** (`raw_quality.py`): replays `raw/` through the same `parse_kafka_values` + `apply_etl` as the stream, as a batch, into `analytics/data_quality_daily`. It gives daily received / valid / rejected counts, rejections per error code, distinct jobs, and valid events with skills. Because the ETL code is shared, changed rules can be re-run over history.
 - `run_analytics.py` runs all of these and writes `analytics/*.parquet`. Timestamps are formatted in UTC before collecting, to avoid PySpark's implicit local-time conversion.
 
 Spark reads the lake with `spark.read.parquet` when its Hadoop filesystem layer works. On Windows without winutils, it reads through pyarrow and Arrow instead.
@@ -205,3 +243,15 @@ The Spark image (`docker/spark/Dockerfile`) is Python 3.12 + OpenJDK 17 + PySpar
 - `maxOffsetsPerTrigger` bounds the micro-batch size (backpressure).
 - `takeOrdered` gives the RDD top-k without a full sort.
 - The analytics `cache()` the event DataFrame that all queries share.
+
+## 12. Verification
+
+`scripts/verify_pipeline.py` reconciles the whole run and exits non-zero on any failure:
+
+- Every ID is unique within the raw archive, processed events and quarantine.
+- No message is both processed and rejected.
+- The raw archive equals processed ∪ quarantined: nothing silently dropped, nothing processed without being archived.
+- With `--kafka`: every offset in the topic is in the raw archive.
+- With an HBase store: every processed job exists in HBase, and its status matches its latest non-duplicate event.
+
+On the end-to-end Docker run (real Kafka and HBase), all checks passed: 6,400 offsets = 6,400 archived = 6,077 processed + 323 quarantined, and 2,282 consistent HBase jobs. The check also caught a real bug during development: local-runner IDs collided for byte-identical messages.

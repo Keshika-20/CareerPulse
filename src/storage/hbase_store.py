@@ -61,6 +61,10 @@ STATE_FIELDS = (
     "last_event",
     "last_event_time",
     "fingerprint",
+    "employment_type",
+    "work_mode",
+    "education",
+    "skills",
 )
 MULTI_GET_CHUNK = 500
 
@@ -593,7 +597,10 @@ class HBaseJobStore:
             **{field: base.get(field) for field in STATE_FIELDS if field in base},
             **{
                 field: event.get(field)
-                for field in ("company", "title", "location", "experience", "salary", "category", "source", "fingerprint")
+                for field in (
+                    "company", "title", "location", "experience", "salary", "category", "source",
+                    "fingerprint", "employment_type", "work_mode", "education", "skills",
+                )
                 if field in event
             },
             "job_id": str(event["job_id"]),

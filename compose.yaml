@@ -80,6 +80,17 @@ services:
       - careerpulse_ivy_cache:/root/.ivy2
     restart: unless-stopped
 
+  alert-consumer:
+    # Real-time downstream app: prints every alert from the job-alerts topic.
+    image: careerpulse-spark:latest
+    container_name: careerpulse-alert-consumer
+    profiles: ["pipeline"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["python", "-m", "src.streaming.alert_consumer", "--bootstrap-servers=kafka:29092", "--from-beginning"]
+    restart: unless-stopped
+
   spark-analytics:
     image: careerpulse-spark:latest
     build:

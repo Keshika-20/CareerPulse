@@ -6,7 +6,7 @@ import math
 import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 COMPANIES = [
     "Google",
@@ -151,6 +151,34 @@ SALARY_BANDS = {
     "6-8 years": (2000000, 3200000),
     "8+ years": (2600000, 4000000),
 }
+# Skills each role typically asks for. Declared skills sometimes use aliases
+# ("py", "k8s", "PySpark") and descriptions mention extra skills in free text,
+# so the ETL has real standardisation and extraction work to do.
+TITLE_SKILLS = {
+    "Software Engineer": ["Python", "Java", "SQL", "Docker", "Git", "AWS", "Linux"],
+    "Data Engineer": ["Python", "SQL", "PySpark", "Kafka", "Airflow", "AWS", "Hadoop", "Scala"],
+    "Product Manager": ["SQL", "Excel", "Figma", "Tableau"],
+    "Machine Learning Engineer": ["Python", "PyTorch", "TensorFlow", "ML", "SQL", "Docker", "NLP"],
+    "DevOps Engineer": ["Docker", "k8s", "Terraform", "AWS", "Linux", "CI/CD", "Python"],
+    "Data Analyst": ["SQL", "Excel", "Tableau", "PowerBI", "Python"],
+    "Backend Engineer": ["Java", "Go", "py", "SQL", "Kafka", "Docker", "Kubernetes"],
+    "Frontend Engineer": ["JavaScript", "TypeScript", "React", "Node.js", "Figma"],
+    "Cloud Engineer": ["AWS", "Azure", "GCP", "Terraform", "Kubernetes", "Linux"],
+    "QA Engineer": ["Selenium", "Python", "Java", "CI/CD", "SQL"],
+}
+# Raw value -> weight. Deliberately inconsistent spellings exercise standardisation.
+EMPLOYMENT_VARIANTS = {"Full-time": 50, "full time": 10, "FT": 6, "Permanent": 4, "Contract": 8,
+                       "contractor": 4, "Internship": 6, "intern": 2, "Part-time": 4}
+WORK_MODE_VARIANTS = {"Onsite": 30, "on-site": 8, "Hybrid": 35, "hybrid ": 5, "Remote": 15, "WFH": 4, None: 3}
+EDUCATION_LEVELS = ["B.Tech", "B.E.", "M.Tech", "B.Sc", "M.Sc", "MBA", "Any graduate"]
+DESCRIPTION_TEMPLATES = (
+    "We are hiring a {title} at {company} to build reliable products with {skills}. "
+    "{experience} of experience expected.",
+    "Join {company} as a {title}. You will work daily with {skills} in a {mode} team based in {location}.",
+    "{company} is looking for a {title} ({experience}). Strong {skills} skills are a must; "
+    "exposure to {extra} is a plus.",
+)
+
 MALFORMED_SAMPLES = (
     lambda event: "{not valid json",
     lambda event: {**event, "company": ""},
@@ -172,22 +200,57 @@ class JobEventSimulator:
 
     ACTION_WEIGHTS = {"NEW": 0.45, "MODIFIED": 0.22, "DUPLICATE": 0.10, "CLOSED": 0.23}
 
-    def __init__(self, seed: Optional[int] = None, invalid_rate: float = 0.0, max_open: int = 400) -> None:
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        invalid_rate: float = 0.0,
+        max_open: int = 400,
+        enriched: bool = True,
+    ) -> None:
         if not 0 <= invalid_rate < 1:
             raise ValueError("invalid_rate must be in [0, 1).")
         self.rng = random.Random(seed)
         self.invalid_rate = invalid_rate
         self.max_open = max_open
+        self.enriched = enriched
         self.open_jobs: Dict[str, Dict[str, Any]] = {}
         self._next_id = 1000 + self.rng.randint(0, 8000) * 100
+        # Hiring surge: while set, NEW postings for this title dominate the stream.
+        self.surge_title: Optional[str] = None
+        self.surge_factor = 8.0
 
     def _demand_weights(self, moment: datetime) -> List[float]:
         hour = moment.hour + moment.minute / 60
         weights = []
         for title in TITLES:
             base, peak = TITLE_DEMAND[title]
-            weights.append(base * (1.0 + 0.6 * math.cos(2 * math.pi * (hour - peak) / 24)))
+            weight = base * (1.0 + 0.6 * math.cos(2 * math.pi * (hour - peak) / 24))
+            if title == self.surge_title:
+                weight *= self.surge_factor
+            weights.append(weight)
         return weights
+
+    def _weighted(self, variants: Dict[Any, int]) -> Any:
+        return self.rng.choices(list(variants), weights=list(variants.values()))[0]
+
+    def _enrichment(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """Semi-structured and unstructured attributes of a new posting."""
+        pool = TITLE_SKILLS[job["title"]]
+        declared = self.rng.sample(pool, k=min(len(pool), self.rng.randint(2, 4)))
+        mentioned = self.rng.sample(pool, k=min(len(pool), 2))
+        extra = self.rng.choice([skill for skills in TITLE_SKILLS.values() for skill in skills])
+        mode = "Remote" if job["location"] == "Remote" else self._weighted(WORK_MODE_VARIANTS)
+        description = self.rng.choice(DESCRIPTION_TEMPLATES).format(
+            title=job["title"], company=job["company"], skills=" and ".join(mentioned),
+            experience=job["experience"], mode=(mode or "hybrid").strip().lower(),
+            location=job["location"], extra=extra,
+        )
+        return {
+            "employment_type": self._weighted(EMPLOYMENT_VARIANTS),
+            "work_mode": mode,
+            "requirements": {"skills": declared, "education": self.rng.choice(EDUCATION_LEVELS)},
+            "description": description,
+        }
 
     def _salary(self, experience: str) -> int:
         low, high = SALARY_BANDS[experience]
@@ -196,7 +259,7 @@ class JobEventSimulator:
     def _new_job(self, moment: datetime) -> Dict[str, Any]:
         self._next_id += 1
         experience = self.rng.choice(EXPERIENCE_LEVELS)
-        return {
+        job = {
             "job_id": f"J{self._next_id}",
             "company": self.rng.choices(COMPANIES, weights=COMPANY_WEIGHTS)[0],
             "title": self.rng.choices(TITLES, weights=self._demand_weights(moment))[0],
@@ -204,6 +267,9 @@ class JobEventSimulator:
             "experience": experience,
             "salary": self._salary(experience),
         }
+        if self.enriched:
+            job.update(self._enrichment(job))
+        return job
 
     def _modify(self, job: Dict[str, Any]) -> None:
         field = self.rng.choice(("salary", "salary", "location", "title", "experience"))
@@ -218,6 +284,8 @@ class JobEventSimulator:
     def next_event(self, moment: Optional[datetime] = None) -> Any:
         moment = moment or datetime.now(timezone.utc)
         if not self.open_jobs or len(self.open_jobs) < 5:
+            action = "NEW"
+        elif self.surge_title and self.rng.random() < 0.6:
             action = "NEW"
         elif len(self.open_jobs) >= self.max_open:
             action = self.rng.choice(("MODIFIED", "CLOSED"))
@@ -245,13 +313,25 @@ class JobEventSimulator:
         *,
         start: Optional[datetime] = None,
         span: Optional[timedelta] = None,
+        surge: Optional[Tuple[str, float, float]] = None,
     ) -> List[Any]:
-        """Generate ``count`` events, evenly spread over ``span`` from ``start``."""
+        """Generate ``count`` events, evenly spread over ``span`` from ``start``.
+
+        ``surge=(title, start_fraction, end_fraction)`` turns on a hiring surge
+        for that title during that fraction of the run.
+        """
         if count < 0:
             raise ValueError("count must be non-negative.")
         start = start or datetime.now(timezone.utc)
         step = (span / count) if span and count else timedelta(0)
-        return [self.next_event(start + step * index) for index in range(count)]
+        events = []
+        for index in range(count):
+            if surge is not None:
+                fraction = index / max(count, 1)
+                self.surge_title = surge[0] if surge[1] <= fraction < surge[2] else None
+            events.append(self.next_event(start + step * index))
+        self.surge_title = None
+        return events
 
 
 def write_events(events: Iterable[Dict[str, Any]], output_path: str) -> Path:

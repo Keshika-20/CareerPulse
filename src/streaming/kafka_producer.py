@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.generator.job_generator import JobEventSimulator, generate_batch
+from src.generator.job_generator import TITLES, JobEventSimulator, generate_batch
 
 try:
     from kafka import KafkaProducer
@@ -110,9 +110,12 @@ class KafkaJobProducer:
         future = self._producer.send(self.topic, value=event, key=self.message_key(event))
         future.get(timeout=self.timeout_seconds)
 
-    def send_async(self, event: Any):
+    def send_async(self, event: Any, key: Optional[str] = None):
         """Queue one event without waiting; returns the delivery future."""
-        return self._producer.send(self.topic, value=event, key=self.message_key(event))
+        return self._producer.send(self.topic, value=event, key=key or self.message_key(event))
+
+    def flush(self) -> None:
+        self._producer.flush()
 
     def send_batch(self, events: Iterable[Any]) -> int:
         """Pipeline many sends, then wait once for every acknowledgement.
@@ -132,6 +135,49 @@ class KafkaJobProducer:
             self._producer.close(timeout=self.timeout_seconds)
 
 
+def ensure_topics(
+    bootstrap_servers: str,
+    topics: Iterable[str],
+    *,
+    partitions: int = 3,
+    replication_factor: int = 1,
+    retries: int = 20,
+    retry_delay_seconds: float = 3.0,
+) -> None:
+    """Create Kafka topics that do not exist yet (idempotent).
+
+    Consumers call this before subscribing: Spark's Kafka source fails if its
+    topic does not exist, so starting the stream before the first producer
+    would otherwise crash it.
+    """
+    from kafka.admin import KafkaAdminClient, NewTopic
+    from kafka.errors import TopicAlreadyExistsError
+
+    servers = [server.strip() for server in bootstrap_servers.split(",") if server.strip()]
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            admin = KafkaAdminClient(bootstrap_servers=servers, client_id="careerpulse-admin")
+            try:
+                missing = [topic for topic in topics if topic not in set(admin.list_topics())]
+                if missing:
+                    try:
+                        admin.create_topics([
+                            NewTopic(name=topic, num_partitions=partitions, replication_factor=replication_factor)
+                            for topic in missing
+                        ])
+                    except TopicAlreadyExistsError:
+                        pass  # created concurrently by another client
+                return
+            finally:
+                admin.close()
+        except Exception as exc:  # broker may still be starting
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(retry_delay_seconds)
+    raise RuntimeError(f"Unable to ensure Kafka topics {list(topics)}: {last_error}")
+
+
 def stream_events(
     producer: KafkaJobProducer,
     simulator: JobEventSimulator,
@@ -139,8 +185,15 @@ def stream_events(
     rate: float,
     duration_seconds: Optional[float] = None,
     max_events: Optional[int] = None,
+    surge_title: Optional[str] = None,
+    surge_after: float = 60.0,
+    surge_duration: float = 120.0,
 ) -> int:
-    """Publish simulator events continuously at ``rate`` events per second."""
+    """Publish simulator events continuously at ``rate`` events per second.
+
+    With ``surge_title``, a hiring surge for that title runs from
+    ``surge_after`` seconds for ``surge_duration`` seconds.
+    """
     interval = 1.0 / rate
     started = time.monotonic()
     sent = 0
@@ -148,6 +201,12 @@ def stream_events(
     while (max_events is None or sent < max_events) and (
         duration_seconds is None or time.monotonic() - started < duration_seconds
     ):
+        if surge_title:
+            elapsed = time.monotonic() - started
+            active = surge_after <= elapsed < surge_after + surge_duration
+            if active != (simulator.surge_title == surge_title):
+                simulator.surge_title = surge_title if active else None
+                print(f"Hiring surge for {surge_title} {'started' if active else 'ended'}", flush=True)
         pending.append(producer.send_async(simulator.next_event()))
         sent += 1
         if sent % 50 == 0:
@@ -177,6 +236,9 @@ def main() -> None:
     parser.add_argument("--backfill-hours", type=float, default=0, help="Send --count simulated events spread over the past N hours")
     parser.add_argument("--invalid-rate", type=float, default=0.0, help="Fraction of malformed records to include")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--surge-title", default=None, help="Simulate a hiring surge for this job title (e.g. 'Data Engineer')")
+    parser.add_argument("--surge-after", type=float, default=60.0, help="Stream mode: seconds before the surge starts")
+    parser.add_argument("--surge-duration", type=float, default=120.0, help="Stream mode: surge length in seconds")
     args = parser.parse_args()
 
     if args.count is not None and args.count < 0:
@@ -184,6 +246,8 @@ def main() -> None:
     batch_count = 25 if args.count is None else args.count
     if args.rate <= 0:
         parser.error("--rate must be positive")
+    if args.surge_title and args.surge_title not in TITLES:
+        parser.error(f"--surge-title must be one of: {', '.join(TITLES)}")
 
     producer = KafkaJobProducer(
         bootstrap_servers=args.bootstrap_servers,
@@ -194,15 +258,24 @@ def main() -> None:
     try:
         if args.backfill_hours:
             span = timedelta(hours=args.backfill_hours)
-            events = simulator.generate(batch_count, start=datetime.now(timezone.utc) - span, span=span)
+            # In a backfill the surge occupies 90-95% of the time span.
+            surge = (args.surge_title, 0.90, 0.95) if args.surge_title else None
+            events = simulator.generate(
+                batch_count, start=datetime.now(timezone.utc) - span, span=span, surge=surge
+            )
             producer.send_batch(events)
             sent = len(events)
             if args.stream:
-                sent += stream_events(producer, simulator, rate=args.rate, duration_seconds=args.duration)
+                sent += stream_events(
+                    producer, simulator, rate=args.rate, duration_seconds=args.duration,
+                    surge_title=args.surge_title, surge_after=args.surge_after,
+                    surge_duration=args.surge_duration,
+                )
         elif args.stream:
             sent = stream_events(
                 producer, simulator, rate=args.rate, duration_seconds=args.duration,
-                max_events=args.count,
+                max_events=args.count, surge_title=args.surge_title,
+                surge_after=args.surge_after, surge_duration=args.surge_duration,
             )
         elif args.invalid_rate:
             events = simulator.generate(batch_count)

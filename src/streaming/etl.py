@@ -17,7 +17,14 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from src.common.models import VALID_EVENTS, derive_category, job_fingerprint
+from src.common.models import (
+    VALID_EVENTS,
+    derive_category,
+    job_fingerprint,
+    merge_skills,
+    standardize_employment_type,
+    standardize_work_mode,
+)
 
 REQUIRED_NON_NULL = ("job_id", "company", "title", "location", "timestamp", "event")
 TEXT_FIELDS = ("job_id", "company", "title", "location", "experience", "source")
@@ -93,4 +100,20 @@ def clean_and_validate(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str
     record["event_time"] = event_time.isoformat()
     record["category"] = derive_category(record["title"])
     record["fingerprint"] = job_fingerprint(record)
+    enrich_optional_fields(record, raw)
     return record, None
+
+
+def enrich_optional_fields(record: Dict[str, Any], raw: Dict[str, Any]) -> None:
+    """Standardise the optional high-dimensional fields; they never reject a record.
+
+    ``requirements`` is a nested object and ``description`` is unstructured
+    text: skills come from both (declared skills normalised through aliases,
+    plus skills recognised in the text).
+    """
+    requirements = raw.get("requirements") if isinstance(raw.get("requirements"), dict) else {}
+    record["employment_type"] = standardize_employment_type(clean_text(raw.get("employment_type")))
+    record["work_mode"] = standardize_work_mode(clean_text(raw.get("work_mode")), record.get("location"))
+    record["education"] = clean_text(requirements.get("education"))
+    record["skills"] = merge_skills(requirements.get("skills"), clean_text(raw.get("description")))
+    record["skill_count"] = len(record["skills"])

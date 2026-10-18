@@ -54,12 +54,16 @@ class StreamPipeline:
         batch_id: int,
         *,
         rejected: Optional[List[Dict[str, Any]]] = None,
+        raw_records: Optional[List[Dict[str, Any]]] = None,
         partition: int = 0,
     ) -> Dict[str, Any]:
         """Process one partition of a micro-batch; safe to run concurrently per job_id partition."""
+        label = f"{self.source}-b{batch_id:07d}-p{partition:04d}"
+        # Cold storage first: every message is archived as received, valid or not.
+        if raw_records:
+            parquet_store.append_raw(raw_records, self.lake_root, label=label)
         ordered = sorted(records, key=lambda record: str(record.get("event_time") or ""))
         processed = self.detector.process(ordered, batch_id=batch_id) if ordered else []
-        label = f"{self.source}-b{batch_id:07d}-p{partition:04d}"
         parquet_store.append_events(processed, self.lake_root, label=label)
 
         rejected_rows = [{**row, "batch_id": batch_id} for row in rejected or []]
@@ -67,6 +71,7 @@ class StreamPipeline:
             parquet_store.append_quarantine(rejected_rows, self.lake_root, label=label)
         return {
             "partition": partition,
+            "archived": len(raw_records or []),
             "processed": len(processed),
             "rejected": len(rejected_rows),
             "detected": dict(Counter(event["event"] for event in processed)),
@@ -80,6 +85,7 @@ class StreamPipeline:
             detected.update(item.get("detected", {}))
         processed = sum(item.get("processed", 0) for item in summaries)
         rejected = sum(item.get("rejected", 0) for item in summaries)
+        archived = sum(item.get("archived", 0) for item in summaries)
 
         status = self.load_status()
         totals: Counter = Counter(status.get("totals", {}))
@@ -98,6 +104,7 @@ class StreamPipeline:
             "partitions": len(summaries),
             "processed": processed,
             "rejected": rejected,
+            "archived": archived,
             "detected": dict(detected),
             "replay": replay,
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -118,23 +125,41 @@ class StreamPipeline:
         batch_id: int,
         *,
         rejected: Optional[List[Dict[str, Any]]] = None,
+        raw_records: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        return self.record_batch([self.process_partition(records, batch_id, rejected=rejected)], batch_id)
+        summary = self.process_partition(records, batch_id, rejected=rejected, raw_records=raw_records)
+        return self.record_batch([summary], batch_id)
 
     def process_raw_records(self, raw_records: Iterable[Any], batch_id: int) -> Dict[str, Any]:
-        valid, rejected = split_valid(raw_records)
-        return self.process_valid_records(valid, batch_id, rejected=rejected)
+        valid, rejected, archive = split_valid(raw_records, id_prefix=f"{self.source}-b{batch_id}")
+        return self.process_valid_records(valid, batch_id, rejected=rejected, raw_records=archive)
 
 
-def split_valid(raw_records: Iterable[Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def split_valid(
+    raw_records: Iterable[Any],
+    *,
+    id_prefix: str = "local",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validate raw records; returns (valid, rejected, raw archive rows).
+
+    Without a Kafka position, a record's identity is its position in its batch
+    (``<prefix>-<index>``), shared by its archive row and its processed or
+    quarantined row. Identical payloads still get distinct IDs, and re-running
+    the same batch reproduces the same IDs.
+    """
     received_at = datetime.now(timezone.utc).isoformat()
     valid: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
-    for raw in raw_records:
+    archive: List[Dict[str, Any]] = []
+    for index, raw in enumerate(raw_records):
+        raw_value = raw if isinstance(raw, str) else json.dumps(raw, default=str, sort_keys=True)
+        event_id = f"{id_prefix}-{index}"
+        archive.append({"event_id": event_id, "kafka_timestamp": received_at,
+                        "raw_value": raw_value, "received_at": received_at})
         record, error = clean_and_validate(raw)
         if record is not None:
-            valid.append(record)
+            valid.append({**record, "event_id": event_id})
             continue
-        raw_value = raw if isinstance(raw, str) else json.dumps(raw, default=str)
-        rejected.append({"raw_value": raw_value, "validation_error": error, "received_at": received_at})
-    return valid, rejected
+        rejected.append({"event_id": event_id, "raw_value": raw_value,
+                         "validation_error": error, "received_at": received_at})
+    return valid, rejected, archive

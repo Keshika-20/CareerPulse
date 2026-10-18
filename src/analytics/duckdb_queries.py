@@ -188,6 +188,101 @@ class LakeQueries:
             [limit],
         )
 
+    def alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
+        path = self._glob(parquet_store.ALERTS_DATASET)
+        if path is None:
+            return []
+        return self._rows(
+            f"""
+            SELECT created_at, alert_type, severity, subject, message, observed, threshold, baseline,
+                   window_start, alert_id
+            FROM read_parquet('{path}', hive_partitioning = true, union_by_name = true)
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            [limit],
+        )
+
+    def category_windows(self, limit_windows: int = 60) -> List[Dict[str, Any]]:
+        """Per-category sliding-window metrics for the most recent windows."""
+        path = self._glob(parquet_store.CATEGORY_WINDOW_DATASET)
+        if path is None:
+            return []
+        return self._rows(
+            f"""
+            WITH windows AS (SELECT * FROM read_parquet('{path}')),
+                 recent AS (SELECT DISTINCT window_start FROM windows ORDER BY window_start DESC LIMIT ?)
+            SELECT w.* FROM windows w JOIN recent USING (window_start)
+            ORDER BY w.window_start, w.category
+            """,
+            [limit_windows],
+        )
+
+    def latest_category_window(self) -> List[Dict[str, Any]]:
+        """Each category's metrics in the latest complete window ("last 5 minutes")."""
+        path = self._glob(parquet_store.CATEGORY_WINDOW_DATASET)
+        if path is None:
+            return []
+        return self._rows(
+            f"""
+            WITH windows AS (SELECT * FROM read_parquet('{path}')),
+                 -- Newest window that has already ended; for backfilled data
+                 -- (all windows in the past) this is simply the newest one.
+                 latest AS (
+                     SELECT COALESCE(
+                         (SELECT MAX(window_end) FROM windows WHERE window_end <= now()),
+                         (SELECT MAX(window_end) FROM windows)
+                     ) AS window_end
+                 )
+            SELECT w.category, w.window_start, w.window_end, w.new_postings, w.closed_postings,
+                   w.events, ROUND(w.avg_salary) AS avg_salary, w.active_companies
+            FROM windows w JOIN latest USING (window_end)
+            ORDER BY w.new_postings DESC, w.category
+            """
+        )
+
+    def top_skills(self, limit: int = 15) -> List[Dict[str, Any]]:
+        source = self._events()
+        if source is None:
+            return []
+        try:
+            return self._rows(
+                f"""
+                SELECT skill, COUNT(*) AS new_postings
+                FROM (SELECT unnest(skills) AS skill FROM {source} WHERE event = 'NEW')
+                GROUP BY skill ORDER BY new_postings DESC, skill LIMIT ?
+                """,
+                [limit],
+            )
+        except duckdb.Error:  # lake written before the skills column existed
+            return []
+
+    def work_mode_mix(self) -> List[Dict[str, Any]]:
+        source = self._events()
+        if source is None:
+            return []
+        try:
+            return self._rows(
+                f"""
+                SELECT COALESCE(work_mode, 'Unknown') AS work_mode, COUNT(*) AS new_postings
+                FROM {source} WHERE event = 'NEW' GROUP BY 1 ORDER BY new_postings DESC
+                """
+            )
+        except duckdb.Error:
+            return []
+
+    def raw_archive_stats(self) -> Dict[str, Any]:
+        path = self._glob(parquet_store.RAW_DATASET)
+        if path is None:
+            return {"messages": 0, "files": 0, "first_received": None, "last_received": None}
+        row = self._rows(
+            f"""
+            SELECT COUNT(*) AS messages, MIN(received_at) AS first_received, MAX(received_at) AS last_received
+            FROM read_parquet('{path}', hive_partitioning = true)
+            """
+        )[0]
+        row["files"] = len(parquet_store.dataset_files(self.lake_root, parquet_store.RAW_DATASET))
+        return row
+
     def analytics_table(self, name: str) -> List[Dict[str, Any]]:
         path = self.lake_root / parquet_store.ANALYTICS_DATASET / f"{name}.parquet"
         if not path.exists():

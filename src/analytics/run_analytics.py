@@ -1,7 +1,9 @@
 """Run the CareerPulse batch analytics over the Parquet event lake.
 
-Spark SQL hiring trends, Spark RDD top-k / trending companies, the MLlib
-demand forecast and MinHash LSH near-duplicate postings. Outputs land in ``<lake>/analytics`` for the dashboard.
+Spark SQL hiring trends (including skills and work-mode mix), Spark RDD top-k /
+trending companies, the MLlib demand forecast, MinHash LSH near-duplicate
+postings, and a daily data-quality report re-derived from the raw archive (cold
+storage). Outputs land in ``<lake>/analytics`` for the dashboard.
 
     python -m src.analytics.run_analytics --lake data/lake --bucket-minutes 60
 """
@@ -52,6 +54,7 @@ def run_all(
     with_ml: bool = True,
     with_near_duplicates: bool = True,
     near_duplicate_similarity: float = 0.85,
+    with_raw_quality: bool = True,
 ) -> Dict[str, Any]:
     events = spark_analytics.load_events(spark, lake_root).cache()
     total_events = events.count()
@@ -77,6 +80,11 @@ def run_all(
 
         near_duplicates = find_near_duplicates(events, min_similarity=near_duplicate_similarity)
         outputs["near_duplicate_postings"] = near_duplicates["pairs"]
+
+    if with_raw_quality:
+        from src.analytics.raw_quality import run as raw_quality
+
+        outputs["data_quality_daily"] = raw_quality(spark, lake_root)
 
     for name, records in outputs.items():
         parquet_store.write_analytics_table(records, lake_root, name)
@@ -105,6 +113,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--bucket-minutes", type=int, default=60, help="Time bucket for the demand model")
     parser.add_argument("--skip-ml", action="store_true")
     parser.add_argument("--skip-near-duplicates", action="store_true")
+    parser.add_argument("--skip-raw-quality", action="store_true", help="Skip the batch job over the raw archive")
     parser.add_argument("--near-duplicate-similarity", type=float, default=0.85,
                         help="Minimum Jaccard similarity for two open postings to be reported as near-duplicates")
     args = parser.parse_args(argv)
@@ -120,6 +129,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             bucket_minutes=args.bucket_minutes,
             with_ml=not args.skip_ml,
             with_near_duplicates=not args.skip_near_duplicates,
+            with_raw_quality=not args.skip_raw_quality,
             near_duplicate_similarity=args.near_duplicate_similarity,
         )
     except FileNotFoundError as exc:

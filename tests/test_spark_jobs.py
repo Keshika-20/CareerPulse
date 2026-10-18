@@ -50,6 +50,10 @@ RAW_SAMPLES = [
     json.dumps({**BASE, "salary": -5}),
     json.dumps({**BASE, "salary": True}),
     json.dumps({**BASE, "timestamp": "yesterday"}),
+    json.dumps({**BASE, "employment_type": "FT", "work_mode": "on-site", "description": "Python, Kafka & k8s daily",
+                "requirements": {"skills": ["PySpark", " ML ", "Go"], "education": " M.Tech "}}),
+    json.dumps({**BASE, "location": "Remote", "employment_type": "gig", "requirements": "not an object"}),
+    json.dumps({**BASE, "requirements": {"skills": [True, "SQL", ""]}, "description": None}),
 ]
 
 
@@ -85,6 +89,11 @@ def test_spark_etl_matches_python_rules(spark):
             assert row["event"] == expected["event"]
             assert row["salary"] == expected["salary"]
             assert row["category"] == expected["category"]
+            assert row["employment_type"] == expected["employment_type"]
+            assert row["work_mode"] == expected["work_mode"]
+            assert row["education"] == expected["education"]
+            assert list(row["skills"]) == expected["skills"], raw
+            assert row["skill_count"] == expected["skill_count"]
             assert row["event_time_iso"].replace("Z", "+00:00").startswith(expected["event_time"][:19])
 
 
@@ -236,3 +245,46 @@ def test_demand_model_reports_insufficient_data(spark):
     result = forecast_demand(_events_frame(spark, _lake_records()), bucket_minutes=60)
     assert result["status"] == "insufficient_data"
     assert result["predictions"] == []
+
+
+def test_category_window_metrics(spark):
+    from src.streaming.spark_kafka_consumer import category_window_metrics
+
+    values = [
+        json.dumps({**BASE, "job_id": "A", "salary": 1000000, "timestamp": "2026-10-06T10:00:30Z", "company": "X"}),
+        json.dumps({**BASE, "job_id": "B", "salary": 2000000, "timestamp": "2026-10-06T10:01:30Z", "company": "Y"}),
+        json.dumps({**BASE, "job_id": "A", "event": "CLOSED", "timestamp": "2026-10-06T10:02:30Z", "company": "X"}),
+    ]
+    valid = apply_etl(parse_kafka_values(_kafka_frame(spark, values))).where("validation_error IS NULL")
+    rows = {
+        row["window_start"]: row.asDict()
+        for row in category_window_metrics(valid, watermark="10 minutes", window="5 minutes", slide="1 minute").collect()
+    }
+    first = rows["2026-10-06T10:00:00.000000Z"]
+    assert (first["new_postings"], first["closed_postings"], first["events"]) == (2, 1, 3)
+    assert first["avg_salary"] == 1500000.0 and first["active_companies"] == 2
+
+
+def test_raw_archive_batch_job_and_skill_queries(spark, tmp_path):
+    from src.analytics import raw_quality
+
+    events = JobEventSimulator(seed=21, invalid_rate=0.1).generate(
+        400, start=datetime(2026, 10, 6, tzinfo=timezone.utc), span=timedelta(hours=2)
+    )
+    StreamPipeline(HBaseJobStore(), tmp_path, source="t").process_raw_records(events, batch_id=0)
+
+    report = raw_quality.run(spark, tmp_path)
+    assert len(report) == 1
+    day = report[0]
+    assert day["received"] == 400 and day["valid"] + day["rejected"] == 400
+    rejected = len(parquet_store.read_dataset(tmp_path, parquet_store.QUARANTINE_DATASET))
+    assert day["rejected"] == rejected  # batch replay of cold storage agrees with the stream
+    assert sum(day[code] for code in raw_quality.ERROR_CODES) == rejected
+    assert day["valid_with_skills"] > 0
+
+    results = spark_analytics.hiring_trends(spark, spark_analytics.load_events(spark, tmp_path))
+    top_skills = spark_analytics.to_records(results["top_skills"])
+    assert top_skills and top_skills[0]["new_postings"] >= top_skills[-1]["new_postings"]
+    assert {row["work_mode"] for row in spark_analytics.to_records(results["work_mode_mix"])} <= {
+        "Onsite", "Hybrid", "Remote", "Other", "Unknown"
+    }
