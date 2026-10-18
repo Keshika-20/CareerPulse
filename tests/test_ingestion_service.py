@@ -135,3 +135,115 @@ def test_dashboard_reads_persisted_ingestion_data_without_demo_fallback(tmp_path
     assert dashboard_data["event_counts"] == {"NEW": 1}
     assert dashboard_data["recent_events"][0]["job_id"] == "greenhouse:acme-board:123"
     assert load_ingested_dashboard_data(tmp_path / "missing.sqlite3") is None
+
+
+class FakeKafkaProducer:
+    """Stands in for KafkaJobProducer; fails once `fail_after` sends succeed."""
+
+    sent: list = []
+    fail_after: int | None = None
+    unreachable = False
+
+    def __init__(self, **_kwargs):
+        if FakeKafkaProducer.unreachable:
+            raise RuntimeError("Unable to bootstrap from ['localhost:9092']")
+
+    def send_event(self, event):
+        if FakeKafkaProducer.fail_after is not None and len(FakeKafkaProducer.sent) >= FakeKafkaProducer.fail_after:
+            raise RuntimeError("broker unavailable")
+        FakeKafkaProducer.sent.append(event)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def fake_kafka(monkeypatch):
+    import src.streaming.kafka_producer as kafka_module
+
+    FakeKafkaProducer.sent = []
+    FakeKafkaProducer.fail_after = None
+    FakeKafkaProducer.unreachable = False
+    monkeypatch.setattr(kafka_module, "KafkaJobProducer", FakeKafkaProducer)
+    return FakeKafkaProducer
+
+
+def two_job_payload(title="Engineer"):
+    return {
+        "jobs": [
+            {"id": 1, "title": title, "absolute_url": "https://boards.greenhouse.io/acme/jobs/1"},
+            {"id": 2, "title": title, "absolute_url": "https://boards.greenhouse.io/acme/jobs/2"},
+        ],
+        "meta": {"total": 2},
+    }
+
+
+def test_kafka_events_left_by_failed_publish_are_retried_on_next_run(tmp_path, fake_kafka):
+    database = tmp_path / "ingestion.sqlite3"
+    fake_kafka.fail_after = 1
+
+    first = IngestionService(
+        service_config(database),
+        with_kafka=True,
+        http_client=QueueClient([two_job_payload()]),
+    ).run()
+
+    assert first["runs"][0]["new"] == 2
+    assert first["kafka"] == {"published": 1, "pending": 1}
+    assert first["failures"][0]["stage"] == "kafka_publish"
+    assert [e["job_id"] for e in fake_kafka.sent] == ["greenhouse:acme-board:1"]
+
+    # The next scan sees no changes, but the unsent NEW event is still delivered.
+    fake_kafka.fail_after = None
+    second = IngestionService(
+        service_config(database),
+        with_kafka=True,
+        http_client=QueueClient([two_job_payload()]),
+    ).run()
+
+    assert second["runs"][0]["unchanged"] == 2
+    assert second["kafka"] == {"published": 1, "pending": 0}
+    assert second["failures"] == []
+    assert [e["job_id"] for e in fake_kafka.sent] == [
+        "greenhouse:acme-board:1",
+        "greenhouse:acme-board:2",
+    ]
+    assert all(e["event"] == "NEW" for e in fake_kafka.sent)
+
+
+def test_run_without_kafka_flag_reports_no_kafka_stats(tmp_path):
+    result = IngestionService(
+        service_config(tmp_path / "ingestion.sqlite3"),
+        http_client=QueueClient([greenhouse_payload()]),
+    ).run()
+    assert "kafka" not in result
+
+
+def test_unreachable_kafka_still_ingests_and_queues_events_for_later(tmp_path, fake_kafka):
+    database = tmp_path / "ingestion.sqlite3"
+    fake_kafka.unreachable = True
+
+    offline = IngestionService(
+        service_config(database),
+        with_kafka=True,
+        http_client=QueueClient([two_job_payload()]),
+    ).run()
+
+    assert offline["runs"][0]["new"] == 2
+    assert offline["kafka"] == {"published": 0, "pending": 2}
+    assert offline["failures"][0]["stage"] == "kafka_connect"
+    assert fake_kafka.sent == []
+
+    fake_kafka.unreachable = False
+    online = IngestionService(
+        service_config(database),
+        with_kafka=True,
+        http_client=QueueClient([two_job_payload()]),
+    ).run()
+
+    assert online["failures"] == []
+    assert online["kafka"] == {"published": 2, "pending": 0}
+    assert [e["job_id"] for e in fake_kafka.sent] == [
+        "greenhouse:acme-board:1",
+        "greenhouse:acme-board:2",
+    ]
