@@ -1,12 +1,6 @@
-# Reference values; the streaming job and analytics take these as CLI flags.
 app_name: "CareerPulse"
 master: "local[*]"
-checkpoint_dir: "./data/checkpoints/job-events"
+checkpoint_dir: "./data/checkpoints"
 batch_duration_seconds: 10
-streaming_topic: "job-events"
-lake_root: "./data/lake"
+streaming_topic: "job_events"
 job_history_table: "job_history"
-company_stats_table: "company_stats"
-watermark: "10 minutes"
-window: "5 minutes"
-slide: "1 minute"

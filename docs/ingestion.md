@@ -1,6 +1,6 @@
 # Public Job-Board Ingestion
 
-CareerPulse's public-source ingestion is a local batch workflow that fetches real company boards into SQLite. With `--kafka` it also publishes its lifecycle events to the `job-events` Kafka topic, where the Spark Structured Streaming job processes them alongside (or instead of) simulated events; see the [runbook](./runbook.md).
+CareerPulse's public-source ingestion is a local batch workflow. It is independent of the synthetic generator, Kafka producer, and existing Parquet helper.
 
 ## Scope and source limits
 
@@ -84,14 +84,6 @@ python -m src.ingestion.service --config .\data\ingestion.local.json --spark-bat
 ```
 
 This option explicitly initializes a local Spark session. A PySpark or Java startup/processing error is not caught or replaced with a Python result. This is batch aggregation only, not Kafka ingestion or Structured Streaming.
-
-To feed the streaming pipeline, publish each committed scan's lifecycle events to Kafka:
-
-```powershell
-python -m src.ingestion.service --config .\data\ingestion.local.json --kafka
-```
-
-Events are queued in SQLite inside the same transaction as the scan and marked published only after Kafka acknowledges them, so an unreachable broker never loses events; the next `--kafka` run delivers the backlog (at-least-once). Configure the broker with an optional `kafka` object (`bootstrap_servers`, `topic`, `timeout_seconds`).
 
 The Streamlit dashboard uses `.\data\processed\ingestion.sqlite3` by default. If the SQLite database path differs, set the environment variable before starting it:
 

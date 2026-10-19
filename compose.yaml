@@ -1,7 +1,4 @@
 
-# Kafka alone:              docker compose up -d kafka
-# Full streaming pipeline:  docker compose --profile pipeline up -d --build
-# Batch analytics (one-off): docker compose --profile analytics run --rm spark-analytics
 services:
   kafka:
     image: apache/kafka:4.1.0
@@ -12,14 +9,12 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      # PLAINTEXT serves clients on the host (localhost:9092); DOCKER serves
-      # other containers on the compose network (kafka:29092).
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,DOCKER://kafka:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,DOCKER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -35,74 +30,5 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  hbase:
-    image: harisekhon/hbase:2.1
-    container_name: careerpulse-hbase
-    hostname: hbase
-    profiles: ["pipeline", "analytics"]
-    ports:
-      # Host ports are overridable when 9090/16010 are taken (e.g. by Prometheus);
-      # containers always reach Thrift at hbase:9090.
-      - "${CAREERPULSE_HBASE_THRIFT_PORT:-9090}:9090"    # Thrift API (happybase)
-      - "${CAREERPULSE_HBASE_UI_PORT:-16010}:16010"      # HBase Master web UI
-    volumes:
-      - careerpulse_hbase_data:/hbase-data
-    restart: unless-stopped
-
-  spark-streaming:
-    build:
-      context: .
-      dockerfile: docker/spark/Dockerfile
-    image: careerpulse-spark:latest
-    container_name: careerpulse-spark-streaming
-    profiles: ["pipeline"]
-    depends_on:
-      kafka:
-        condition: service_healthy
-      hbase:
-        condition: service_started
-    command:
-      - python
-      - -m
-      - src.streaming.spark_kafka_consumer
-      - --bootstrap-servers=kafka:29092
-      - --topic=job-events
-      - --starting-offsets=earliest
-      - --master=local[2]
-      - --lake=/app/data/lake
-      - --checkpoint=/checkpoints/job-events
-      - --hbase-mode=thrift
-      - --hbase-host=hbase
-      - --trigger-seconds=10
-    volumes:
-      - ./data:/app/data
-      - careerpulse_spark_checkpoints:/checkpoints
-      - careerpulse_ivy_cache:/root/.ivy2
-    restart: unless-stopped
-
-  alert-consumer:
-    # Real-time downstream app: prints every alert from the job-alerts topic.
-    image: careerpulse-spark:latest
-    container_name: careerpulse-alert-consumer
-    profiles: ["pipeline"]
-    depends_on:
-      kafka:
-        condition: service_healthy
-    command: ["python", "-m", "src.streaming.alert_consumer", "--bootstrap-servers=kafka:29092", "--from-beginning"]
-    restart: unless-stopped
-
-  spark-analytics:
-    image: careerpulse-spark:latest
-    build:
-      context: .
-      dockerfile: docker/spark/Dockerfile
-    profiles: ["analytics"]
-    command: ["python", "-m", "src.analytics.run_analytics", "--lake=/app/data/lake", "--master=local[2]"]
-    volumes:
-      - ./data:/app/data
-
 volumes:
   careerpulse_kafka_data:
-  careerpulse_hbase_data:
-  careerpulse_spark_checkpoints:
-  careerpulse_ivy_cache:

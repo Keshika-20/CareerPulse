@@ -317,18 +317,9 @@ class IngestionService:
         """
         pending = store.list_pending_kafka_events()
         published = 0
-        # Pipeline the sends (one flush instead of one broker round trip per
-        # event), then confirm acknowledgements in order. Events after the
-        # first failure stay pending even if they were delivered, which can
-        # only cause a redelivery, never a loss.
-        send_async = getattr(kafka_producer, "send_async", None)
-        futures = [send_async(event) for _event_id, event in pending] if send_async else None
-        for index, (event_id, event) in enumerate(pending):
+        for event_id, event in pending:
             try:
-                if futures is not None:
-                    futures[index].get(timeout=getattr(kafka_producer, "timeout_seconds", 10))
-                else:
-                    kafka_producer.send_event(event)
+                kafka_producer.send_event(event)
             except Exception as exc:
                 failures.append(
                     {

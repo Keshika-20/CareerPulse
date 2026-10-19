@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -15,8 +15,6 @@ except ImportError:  # pragma: no cover
     SparkSession = None
 
 from src.common.models import validate_record
-from src.common.spark_session import build_spark_session
-from src.streaming.change_detection import detect_change  # noqa: F401  (re-exported)
 
 
 def aggregate_valid_event_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
@@ -41,7 +39,7 @@ class SparkJobStreamProcessor:
             raise RuntimeError("Spark integration requires a compatible PySpark + Java environment. "
                                "Ordinary Python validation and aggregation do not require a JVM.")
 
-        self.spark = build_spark_session(app_name, master)
+        self.spark = SparkSession.builder.appName(app_name).master(master).getOrCreate()
 
     def process_batch(self, records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
         valid_events = []
@@ -67,6 +65,38 @@ class SparkJobStreamProcessor:
     def close(self) -> None:
         if self.spark is not None:
             self.spark.stop()
+
+
+
+def detect_change(
+    previous_state: Optional[Dict[str, Any]],
+    current_record: Dict[str, Any],
+) -> str:
+    event_name = str(current_record.get("event", "")).upper()
+
+    # A closure event takes priority over changes to job fields.
+    if event_name == "CLOSED":
+        return "CLOSED"
+
+    # A job with no previous state is new.
+    if previous_state is None:
+        return "NEW"
+
+    # Compare fields that define the current job's details.
+    tracked_fields = (
+        "company",
+        "title",
+        "location",
+        "experience",
+        "salary",
+    )
+
+    for field in tracked_fields:
+        if previous_state.get(field) != current_record.get(field):
+            return "MODIFIED"
+
+    # The job details are unchanged; only metadata may differ.
+    return "DUPLICATE"
 
 
 def summarize_event_stream(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:

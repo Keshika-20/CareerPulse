@@ -1,196 +1,116 @@
 # CareerPulse Runbook
 
+This runbook describes the implementation currently present in the repository. It does not describe Kafka-to-Spark streaming, HBase persistence, or a distributed deployment; those integrations are not implemented.
+
 ## Prerequisites
 
-- Python 3.10+ and `pip install -r requirements.txt`
-- Java 17 or 21 for anything that starts Spark (tests, analytics, streaming)
-- Docker Desktop for Kafka, HBase and the Linux Spark container
+- Python 3.10 or newer
+- For optional Spark batch aggregation only: a compatible PySpark and Java installation
+- Network access to the configured public Greenhouse/Lever company-board endpoints
 
-Spark's Python workers are started with the same interpreter as the driver (`src/common/spark_session.py`), so machines with several Pythons installed don't hit `PYTHON_VERSION_MISMATCH`.
+Adapter, normalization, SQLite lifecycle, analytics, and dashboard-data tests use local fixtures and mocked HTTP responses; they do not need live API access or a JVM.
 
-### Spark on Windows
+## Run the test suite
 
-Spark reads and writes local files through Hadoop, which on Windows needs `winutils.exe`. What that means for each part:
-
-| Task | Native Windows without winutils | Alternative |
-|---|---|---|
-| Tests, `scripts/run_pipeline.py --spark`, `src.analytics.run_analytics` | Works: Parquet is read with pyarrow and handed to Spark via Arrow | — |
-| Structured Streaming job (needs checkpoints) | Fails fast with a clear message | `docker compose --profile pipeline up -d --build`, or install winutils (`HADOOP_HOME`, or `tools/hadoop/bin/winutils.exe`) |
-
-On Linux and macOS everything runs natively.
-
-## 1. Local end-to-end run (no Kafka or Docker)
+Run the focused non-Spark tests:
 
 ```powershell
-python scripts/run_pipeline.py --count 3000 --backfill-hours 24 --invalid-rate 0.03 --reset --spark
+python -m pytest .\tests\test_generator.py .\tests\test_ingestion_sources.py .\tests\test_ingestion_sqlite.py .\tests\test_ingestion_service.py .\tests\test_analytics.py -q
 ```
 
-What it does:
-
-1. The simulator writes 3,000 lifecycle events spread over the last 24 hours to `data/raw/job_events.jsonl`, about 3% of them malformed.
-2. A hiring surge for Data Engineer is injected at 90–95% of the time span (`--surge-title ""` disables it).
-3. Events go through `StreamPipeline` in micro-batches. This is the same code the Spark job calls in `foreachBatch`: raw archive, validation, change detection against HBase, HBase writes and Parquet lake appends.
-4. Per-category sliding windows are computed, and hiring-surge and data-quality alerts are printed and written to `data/lake/alerts`.
-5. It prints DuckDB KPIs over `data/lake`.
-6. `--spark` runs Spark SQL, RDD, MLlib and the cold-storage batch job into `data/lake/analytics`.
-
-Then reconcile the run:
+The tests in `tests\test_streaming.py` that exercise `process_batch()` create a real local Spark session. Run them separately when Java/PySpark is configured:
 
 ```powershell
-python scripts/verify_pipeline.py --lake data/lake
+python -m pytest .\tests\test_streaming.py -q
 ```
 
-HBase defaults to the embedded emulator in `data/hbase/careerpulse_hbase.sqlite3`. Pass `--hbase-mode thrift` to use a real HBase.
-
-## 2. Streaming pipeline with Docker
-
-```powershell
-docker compose --profile pipeline up -d --build
-```
-
-This starts:
-
-- `kafka`: KRaft broker. Host clients use `localhost:9092`; containers use `kafka:29092`.
-- `hbase`: HBase 2.1 with Thrift on `localhost:9090` and the master UI at http://localhost:16010. If those host ports are taken (Prometheus also uses 9090), set `CAREERPULSE_HBASE_THRIFT_PORT` / `CAREERPULSE_HBASE_UI_PORT` before `up`, and point host clients at the new port with `CAREERPULSE_HBASE_PORT`.
-- `spark-streaming`: the Structured Streaming job with 10-second micro-batches, writing to HBase over Thrift and to `./data/lake` (bind-mounted). It creates the `job-events` and `job-alerts` topics if missing. On its first start it downloads the Spark Kafka connector into a cached volume.
-- `alert-consumer`: a real-time app that prints every alert from `job-alerts`.
-
-Produce events from the host:
-
-```powershell
-# 2 h of history with a Data Engineer surge near the end, then a live stream of 10 events/s
-python -m src.streaming.kafka_producer --backfill-hours 2 --count 6000 --surge-title "Data Engineer" --stream --rate 10 --invalid-rate 0.03
-# a live surge: starts after 60 s, lasts 120 s (watch for HIRING_SURGE)
-python -m src.streaming.kafka_producer --stream --rate 20 --duration 300 --surge-title "Machine Learning Engineer"
-# a burst of malformed data (watch for DATA_QUALITY)
-python -m src.streaming.kafka_producer --stream --rate 20 --duration 20 --invalid-rate 0.35
-# or real public-board listings
-python -m src.ingestion.service --config .\data\ingestion.local.json --kafka
-```
-
-Watch the job:
-
-```powershell
-docker logs -f careerpulse-spark-streaming   # "Batch N: processed=... rejected=... detected={...}" and "ALERT ..."
-docker logs -f careerpulse-alert-consumer    # alerts as a downstream app receives them
-# or on the host:
-python -m src.streaming.alert_consumer --bootstrap-servers localhost:9092 --from-beginning
-```
-
-To trigger workflows, pass a webhook to the job. It POSTs `{"text": message, "alert": {...}}`, the format Slack and Teams incoming webhooks accept: add `--alert-webhook=https://...` to the `spark-streaming` command in `compose.yaml`. Thresholds are set with `--surge-ratio` and `--max-rejection-rate`.
-
-Verify the run end to end (use the host port you mapped for Thrift):
-
-```powershell
-python scripts/verify_pipeline.py --kafka localhost:9092 --hbase-mode thrift --hbase-port 9090
-```
-
-It expects a lake created from a clean start. Data written before the raw archive existed can't be reconciled, so reset first with `docker compose --profile pipeline down -v` and `Remove-Item -Recurse data\lake`.
-
-Run the batch analytics:
-
-```powershell
-docker compose --profile analytics run --rm spark-analytics
-# or natively:
-python -m src.analytics.run_analytics --lake data/lake --bucket-minutes 60
-```
-
-Stop everything with `docker compose --profile pipeline down`. Add `-v` to also delete the Kafka, HBase and checkpoint volumes.
-
-### Running the streaming job natively (Linux, macOS, or Windows with winutils)
-
-```powershell
-docker compose up -d kafka
-python -m src.streaming.spark_kafka_consumer --bootstrap-servers localhost:9092 --hbase-mode local
-```
-
-Useful flags:
-
-- `--available-now`: process what is in the topic, then exit.
-- `--starting-offsets latest`
-- `--trigger-seconds`
-- `--watermark`, `--window`, `--slide`
-- `--hbase-mode thrift --hbase-host localhost`
-- `--hbase-table-prefix demo_`: isolated HBase tables, e.g. for a separate test run
-- `--alerts-topic`, `--alert-webhook`, `--surge-ratio`, `--max-rejection-rate`
-
-## 3. Dashboard
-
-```powershell
-python -m streamlit run .\src\dashboard\app.py
-```
-
-Sign-in uses OIDC (see [authentication-and-big-data.md](./authentication-and-big-data.md)). Environment variables:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `CAREERPULSE_LAKE_PATH` | `./data/lake` | Parquet lake read by DuckDB |
-| `CAREERPULSE_HBASE_MODE` | `local` | `thrift` to read the Docker HBase |
-| `CAREERPULSE_HBASE_HOST` / `_PORT` | `localhost` / `9090` | HBase Thrift server |
-| `CAREERPULSE_HBASE_PATH` | `./data/hbase/careerpulse_hbase.sqlite3` | Emulator file, opened read-only |
-| `CAREERPULSE_HBASE_TABLE_PREFIX` | (empty) | HBase table prefix, matching the job's `--hbase-table-prefix` |
-| `CAREERPULSE_SQLITE_PATH` | `./data/processed/ingestion.sqlite3` | Public-board ingestion database |
-
-The **Streaming analytics** page shows:
-
-- Pipeline status and KPIs
-- A live event feed, with optional auto-refresh every 5 s
-- Streaming window counts
-- Trends by category, company or location (minute, hour or day buckets)
-- Top companies and average salary by category
-- The validation quarantine
-- Spark RDD top-k and trending companies
-- The MLlib forecast with RMSE vs a naive baseline
-- An HBase job lookup: current state, salary cell versions, and the wide-row event history
-
-## 4. Benchmarks
-
-```powershell
-python scripts/benchmark.py pipeline --events 20000                 # single-process pipeline throughput
-python scripts/benchmark.py producer --events 20000                 # Kafka: acknowledged-per-event vs pipelined
-python scripts/benchmark.py spark --events 20000 --partitions 1 2 4 8   # foreachBatch scaling (embedded HBase)
-python scripts/benchmark.py latency --lake data/lake --minutes 10   # end-to-end latency of live events
-```
-
-To measure scaling against the real HBase in Docker (throwaway `bench_p<N>_` tables, dropped afterwards):
-
-```powershell
-docker compose --profile analytics run --rm --no-deps spark-analytics python scripts/benchmark.py spark --hbase-mode thrift --hbase-host hbase
-```
-
-Results are recorded in [benchmarks.md](./benchmarks.md).
-
-## 5. Tests
+The full suite combines both groups:
 
 ```powershell
 python -m pytest -q
 ```
 
-- `test_spark_jobs.py`: Spark ETL parity with the Python rules, the `foreachBatch` handler, window logic, Spark SQL, RDD, and MLlib.
-- `test_streaming.py`: Spark batch aggregation.
-- `test_near_duplicates.py`: open-posting state, MinHash LSH pairs vs an exact all-pairs Jaccard scan, and the run_analytics output table.
-- `test_alerts_and_cold_storage.py`: enrichment and standardisation, simulator surges, category windows, surge and data-quality detection, alert de-duplication and webhook delivery, raw archive, and `verify_pipeline` (including detecting a duplicate and a missing Kafka offset).
-- Concurrency and fault tolerance: `test_counter_increments_are_atomic_across_processes` (4 OS processes on one counter), `test_replaying_a_batch_is_idempotent`, `test_parallel_partitions_match_sequential_processing`, and the replay check in `test_foreach_batch_handler_runs_change_detection_and_storage`.
+## Configure public source accounts
 
-Both start a local Spark session (Java required) but use in-memory DataFrames. Everything else is pure Python.
-
-## 6. Public-board ingestion
-
-See [ingestion.md](./ingestion.md). In short:
+From the repository root:
 
 ```powershell
-Copy-Item .\config\ingestion.example.json .\data\ingestion.local.json   # then enable verified boards
-python -m src.ingestion.service --config .\data\ingestion.local.json [--spark-batch] [--kafka]
+Copy-Item .\config\ingestion.example.json .\data\ingestion.local.json
 ```
 
-## Troubleshooting
+Edit the copied file and set `enabled` to `true` only for board accounts you are authorized to query. Use the documented Greenhouse board token or Lever site identifier and the company name. For Lever, `region` is `global` or `eu`. The copied file is under the Git-ignored `data/` directory; do not commit account configuration.
 
-| Symptom | Cause and fix |
-|---|---|
-| `PYTHON_VERSION_MISMATCH` | Set `PYSPARK_PYTHON` explicitly, or start Spark through `build_spark_session` |
-| `HADOOP_HOME and hadoop.home.dir are unset` | Spark file I/O on Windows. See *Spark on Windows* above |
-| `Failed to find data source: kafka` | The connector package could not be downloaded. Check internet access, or set `CAREERPULSE_SCALA_VERSION` if your Spark build is not Scala 2.13 |
-| Streaming container restarts with HBase errors | HBase takes about a minute to accept Thrift clients. The job retries the connection for about a minute, and Docker restarts it after that |
-| Spark image build times out downloading PySpark (~450 MB) | Put a `pyspark-<version>-py2.py3-none-any.whl` in `docker/spark/wheels/` (git-ignored). The build installs it instead of downloading. `pip cache list --format abspath pyspark` finds one if PySpark was installed locally |
-| `STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE` after upgrading | The window aggregation's output changed, so its old checkpoint state no longer fits. Bump `WINDOW_STATE_VERSION` in `spark_kafka_consumer.py`; the windows query then starts a fresh checkpoint (`windows-v<N>`). It rebuilds window state from Kafka only with `--starting-offsets earliest` (the default) while the topic still retains those offsets; otherwise windows start empty. Existing rows in `window_counts.parquet` are kept, because the merge upserts. The events query keeps its own checkpoint either way |
-| Dashboard shows no window counts | Windows are emitted as event time advances. Keep the producer streaming |
+Configuration fields:
+
+- `sqlite_path`: durable snapshots, lifecycle events, run stats, and optional raw pages
+- `raw_retention_days`: defaults to 7; set to `0` to disable raw-response retention
+- `request_timeout_seconds`: per-request timeout
+- `max_retries`: bounded retries for rate limits, server errors, and network failures
+- `spark`: settings used only by the explicit Spark batch option
+- `sources`: configured Greenhouse and Lever company accounts
+
+For source endpoint and consistency limitations, normalized fields, lifecycle rules, and retention details, see [ingestion documentation](./ingestion.md).
+
+## Run ingestion
+
+From the repository root:
+
+```powershell
+python -m src.ingestion.service --config .\data\ingestion.local.json
+```
+
+This runs source requests, normalizes valid listings, and atomically applies each complete source-account scan to SQLite. It reports per-account counts for new, modified, unchanged, and closed listings. A failed fetch or unverified scan is reported and does not advance that account's snapshot or absence evidence. The command exits nonzero if a configured account fails.
+
+To additionally perform real Spark DataFrame aggregation over the lifecycle events created by each successful scan:
+
+```powershell
+python -m src.ingestion.service --config .\data\ingestion.local.json --spark-batch
+```
+
+This flag starts Spark explicitly. Spark startup or processing failures remain visible. The SQLite source-state transaction commits before the optional Spark batch step; a subsequent Spark failure does not undo that committed ingestion run.
+
+## Run local demonstrations
+
+Generate synthetic job events:
+
+```powershell
+python .\src\generator\job_generator.py --count 10 --output .\data\raw\job_events.jsonl
+```
+
+Run the existing local synthetic pipeline:
+
+```powershell
+python .\scripts\run_pipeline.py
+```
+
+That script uses synthetic events and the existing local Parquet/JSONL helper. It does not run the public-source ingestion service.
+
+The Kafka producer is also separate:
+
+```powershell
+python .\src\streaming\kafka_producer.py --bootstrap-servers localhost:9092 --topic job_events --count 25
+```
+
+It can publish generated events when a broker is available; without `kafka-python`, it prints JSON to stdout. There is no CareerPulse Kafka consumer connected to the ingestion service.
+
+## Run the dashboard
+
+The dashboard reads active snapshots and lifecycle events from `.\data\processed\ingestion.sqlite3` if the database exists. To point it at another configured database:
+
+```powershell
+$env:CAREERPULSE_SQLITE_PATH = ".\data\processed\ingestion.sqlite3"
+python -m streamlit run .\src\dashboard\app.py
+```
+
+When no database exists, the dashboard says it is showing synthetic demo data. It does not silently use demo records when an existing database is invalid.
+
+The dashboard provides Overview, Job explorer, Pipeline control, and Lifecycle events views. The explorer supports text search and company/source/location filters, listing details, original-posting links, and CSV export. Pipeline control can launch the normal ingestion service using the selected configuration and shows recent per-account run statistics. The lifecycle view filters persisted events and supports CSV export.
+
+The dashboard reads the SQLite database in read-only mode. It reports salary information only when the source provides it; unknown salary is not treated as zero, and salary ranges are not converted to an invented scalar or midpoint. The dashboard does not automatically discover all employers: it displays listings from configured and enabled public company boards only.
+
+## Current integration boundaries
+
+- Greenhouse and Lever public company-board fetching, normalization, and per-account SQLite lifecycle snapshots are implemented.
+- Spark is used only for explicit local batch event aggregation. No Structured Streaming source/sink is wired.
+- Kafka producer, in-memory HBase-shaped storage, and Parquet helper remain independent examples and are not downstream sinks for the public ingestion service.
+- No global job search, LinkedIn/Indeed access, ML prediction, or production deployment is implemented.

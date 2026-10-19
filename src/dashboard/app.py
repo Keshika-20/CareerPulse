@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.dashboard.streaming_view import DEFAULT_LAKE, render_streaming_analytics
 from src.generator.job_generator import generate_batch
 
 try:
@@ -651,11 +650,9 @@ def _render_big_data(data: Dict[str, Any], database_path: str, *, can_run: bool 
         ("02 · Quality gates", "Retries, schema checks, completeness, duplicate IDs", "Fail closed", "#70e1c1"),
         ("03 · Data contract", "Normalize into a shared job schema", "Implemented", "#70e1c1"),
         ("04 · State + events", "SQLite snapshots, raw payload retention, lifecycle events", "Implemented", "#70e1c1"),
-        ("05 · Event transport", "Kafka topic job-events (ingestion --kafka or simulator producer)", "Implemented", "#70e1c1"),
-        ("06 · Stream processing", "Spark Structured Streaming: validation, cleaning, category enrichment, change detection, windows", "Implemented", "#70e1c1"),
-        ("07 · Operational store", "HBase job_history (versioned info cells + wide event rows) and company counters", "Implemented", "#70e1c1"),
-        ("08 · Analytical lake", "Date-partitioned Parquet events, quarantine and window aggregates, queried by DuckDB", "Implemented", "#70e1c1"),
-        ("09 · Batch analytics", "Spark SQL trends, RDD top-k trending companies, MLlib demand forecast", "Implemented", "#70e1c1"),
+        ("05 · Batch analytics", "Spark DataFrame aggregation + dashboard metrics", "Opt-in Spark batch", "#f6c76b"),
+        ("06 · Distributed stream", "Kafka topic → consumer / Structured Streaming", "Not end-to-end wired yet", "#f6c76b"),
+        ("07 · Analytical lake", "Partitioned Parquet / historical analytical tables", "Separate helper exists; ingestion export not automated", "#f6c76b"),
     ]
     for title, description, status, accent in stages:
         st.markdown(
@@ -711,17 +708,16 @@ def _render_big_data(data: Dict[str, Any], database_path: str, *, can_run: bool 
         st.code(str(database_path), language="text")
     with storage_cols[1]:
         st.markdown("#### Analytical storage")
-        lake_events = ROOT / "data" / "lake" / "events"
-        files = list(lake_events.rglob("*.parquet")) if lake_events.exists() else []
-        if files:
-            st.success(f"Parquet event lake · {len(files):,} files · {sum(f.stat().st_size for f in files):,} bytes")
+        parquet_path = ROOT / "data" / "processed" / "job_history.parquet"
+        if parquet_path.exists():
+            st.success(f"Parquet file found · {parquet_path.stat().st_size:,} bytes")
         else:
-            st.warning("No processed events in data/lake/events yet.")
-        st.caption("Written by the streaming pipeline; see the Streaming analytics page for DuckDB queries over it.")
+            st.warning("No job_history.parquet file found at the default path.")
+        st.caption("The existing Parquet writer is available; public ingestion does not automatically refresh this file yet.")
     with storage_cols[2]:
         st.markdown("#### Event transport")
-        st.write("Kafka topic `job-events`")
-        st.caption("Run ingestion with --kafka, or the simulator producer, to publish events. No live broker status is inferred here.")
+        st.write("Kafka producer module present")
+        st.caption("The current producer is a separate utility and is not wired to source ingestion. No live broker status is inferred.")
 
     st.markdown("### Source throughput · retained run history")
     if runs:
@@ -766,7 +762,7 @@ def render_dashboard() -> None:
     if role is None:
         _render_access_denied(email)
         return
-    allowed_pages = ["Overview", "Streaming analytics", "Job explorer", "Big Data operations", "Lifecycle events"]
+    allowed_pages = ["Overview", "Job explorer", "Big Data operations", "Lifecycle events"]
     if role in {"admin", "analyst"}:
         allowed_pages.append("Pipeline control")
 
@@ -782,26 +778,16 @@ def render_dashboard() -> None:
         page = st.radio("Workspace", allowed_pages, label_visibility="collapsed")
         st.divider()
         database_path = os.environ.get("CAREERPULSE_SQLITE_PATH", DEFAULT_DB)
-        lake_path = os.environ.get("CAREERPULSE_LAKE_PATH", DEFAULT_LAKE)
-        # Only administrators may point the workspace at different files.
+        # Only administrators may point the workspace at a different file.
         if role == "admin":
             database_path = st.text_input(
                 "SQLite database",
                 value=database_path,
                 help="Path to the SQLite database created by the ingestion service.",
             )
-            lake_path = st.text_input(
-                "Parquet lake",
-                value=lake_path,
-                help="Root directory of the Parquet lake written by the streaming pipeline.",
-            )
-        st.caption("Public boards + simulated stream · OIDC access control")
+        st.caption("Public Greenhouse + Lever boards · OIDC access control")
         if st.button("Refresh workspace", use_container_width=True):
             st.rerun()
-
-    if page == "Streaming analytics":
-        render_streaming_analytics(st, ROOT, lake_path)
-        return
 
     resolved_db = Path(database_path)
     if not resolved_db.is_absolute():
