@@ -87,3 +87,42 @@ def test_generate_job_lifecycle_closed_event_refers_to_same_job():
 def test_generate_job_lifecycle_rejects_invalid_arguments(event_types, job_id):
     with pytest.raises(ValueError):
         generate_job_lifecycle(event_types, job_id=job_id, seed=1)
+
+
+def test_simulator_lifecycles_reference_open_jobs_only():
+    from src.generator.job_generator import JobEventSimulator
+
+    events = JobEventSimulator(seed=4).generate(1000)
+    opened, closed = set(), set()
+    for event in events:
+        job_id = event["job_id"]
+        if event["event"] == "NEW":
+            assert job_id not in opened
+            opened.add(job_id)
+        else:
+            assert job_id in opened and job_id not in closed
+            if event["event"] == "CLOSED":
+                closed.add(job_id)
+    assert {event["event"] for event in events} == {"NEW", "MODIFIED", "DUPLICATE", "CLOSED"}
+
+
+def test_simulator_is_deterministic_and_spreads_timestamps():
+    from datetime import datetime, timedelta, timezone
+
+    from src.generator.job_generator import JobEventSimulator
+
+    start = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    first = JobEventSimulator(seed=9).generate(48, start=start, span=timedelta(hours=24))
+    second = JobEventSimulator(seed=9).generate(48, start=start, span=timedelta(hours=24))
+    assert first == second
+    assert first[0]["timestamp"] == start.isoformat()
+    assert first[-1]["timestamp"] == (start + timedelta(minutes=30 * 47)).isoformat()
+
+
+def test_simulator_injects_malformed_records():
+    from src.generator.job_generator import JobEventSimulator
+    from src.streaming.etl import clean_and_validate
+
+    events = JobEventSimulator(seed=2, invalid_rate=0.5).generate(200)
+    errors = [clean_and_validate(event)[1] for event in events]
+    assert 60 < sum(error is not None for error in errors) < 140
