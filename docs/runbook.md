@@ -128,6 +128,7 @@ Sign-in uses OIDC (see [authentication-and-big-data.md](./authentication-and-big
 | `CAREERPULSE_HBASE_MODE` | `local` | `thrift` to read the Docker HBase |
 | `CAREERPULSE_HBASE_HOST` / `_PORT` | `localhost` / `9090` | HBase Thrift server |
 | `CAREERPULSE_HBASE_PATH` | `./data/hbase/careerpulse_hbase.sqlite3` | Emulator file, opened read-only |
+| `CAREERPULSE_HBASE_TABLE_PREFIX` | (empty) | HBase table prefix, matching the job's `--hbase-table-prefix` |
 | `CAREERPULSE_SQLITE_PATH` | `./data/processed/ingestion.sqlite3` | Public-board ingestion database |
 
 The **Streaming analytics** page shows:

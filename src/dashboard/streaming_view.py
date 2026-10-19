@@ -18,6 +18,7 @@ def hbase_settings() -> Dict[str, Any]:
         "host": os.environ.get("CAREERPULSE_HBASE_HOST", "localhost"),
         "port": int(os.environ.get("CAREERPULSE_HBASE_PORT", "9090")),
         "path": os.environ.get("CAREERPULSE_HBASE_PATH", "./data/hbase/careerpulse_hbase.sqlite3"),
+        "table_prefix": os.environ.get("CAREERPULSE_HBASE_TABLE_PREFIX", ""),
     }
 
 
@@ -32,8 +33,10 @@ def open_hbase_store(root: Path):
             path = root / path
         if not path.exists():
             return None
-        return HBaseJobStore.connect("local", path=path, read_only=True)
-    return HBaseJobStore.connect("thrift", host=settings["host"], port=settings["port"])
+        return HBaseJobStore.connect("local", path=path, read_only=True, table_prefix=settings["table_prefix"])
+    return HBaseJobStore.connect(
+        "thrift", host=settings["host"], port=settings["port"], table_prefix=settings["table_prefix"]
+    )
 
 
 def pivot(rows: List[Dict[str, Any]], index: str, columns: str, values: str):
@@ -320,7 +323,7 @@ def _render_hbase(st, pd, root: Path) -> None:
         return
     try:
         st.caption(
-            "Row key = job_id · `info:*` current state (versioned cells) · `events:<epoch_ms>#<seq>` wide-row history · "
+            "Row key = job_id · `info:*` current state (versioned cells) · `events:<epoch_ms>#<event_id>` wide-row history and replay ledger · "
             f"backend: {'HBase Thrift ' + settings['host'] + ':' + str(settings['port']) if settings['mode'] == 'thrift' else 'embedded HBase emulator'}"
         )
         stats = store.company_stats()
