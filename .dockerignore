@@ -1,8 +1,0 @@
-.git
-.venv
-.venv-spark
-.pytest_cache
-**/__pycache__
-data
-tools
-.streamlit/secrets.toml

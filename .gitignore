@@ -7,7 +7,3 @@ data/
 .venv-spark/
 # Local OIDC credentials and app secrets
 .streamlit/secrets.toml
-# Optional repo-local Hadoop winutils for Spark on Windows
-tools/
-# Optional local wheels for the Spark Docker image
-docker/spark/wheels/*.whl

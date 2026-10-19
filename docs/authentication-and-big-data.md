@@ -27,7 +27,7 @@ viewer_emails = ["your-viewer-email@example.com"]
 Role policy:
 - `admin`: full workspace access, can execute ingestion and Spark batch runs.
 - `analyst`: can inspect pipeline run history and events but cannot execute pipeline jobs.
-- `viewer`: read-only overview, streaming analytics, job explorer, Big Data status, and event views.
+- `viewer`: read-only overview, job explorer, Big Data status, and event views.
 - Signed-in emails that appear on no list are denied access and offered a logout. Every user, including viewers, must be listed explicitly.
 - Only `admin` can change which SQLite database the dashboard reads; other roles use `CAREERPULSE_SQLITE_PATH` or the default path.
 
@@ -43,22 +43,24 @@ Copy `config/ingestion.multi-source.example.json` to a local ignored file, then 
 
 Enable additional entries one at a time. A failed source is reported; successful accounts can still commit independently. Do not put the entire multi-source config into version control if it contains local account choices. Do not scrape LinkedIn/Indeed or bypass access controls. Only published jobs are ingested; missing salary/experience remains unknown instead of being invented.
 
-## Big Data architecture
+## Big Data architecture: implemented vs next stage
 
 ```text
-Simulated job events  ─┐
-Public company boards ─┴─► Kafka job-events ─► Spark Structured Streaming
-   (ingestion --kafka)        (keyed by job_id)    validation · cleaning · category enrichment
-                                                   change detection vs HBase · event-time windows
-                                                        │
-                              HBase job_history / company_stats + Parquet lake (events, quarantine, windows)
-                                                        │
-                              Spark SQL trends · Spark RDD top-k · MLlib demand forecast
-                                                        │
-                                          DuckDB ─► Streamlit (Streaming analytics page)
+Public company job boards (Greenhouse / Lever)
+    -> HTTP retries + response/schema/completeness checks
+    -> normalized job schema + namespaced IDs
+    -> SQLite transactional snapshots + lifecycle event log
+    -> Streamlit job explorer / operational metrics
+    -> optional Spark DataFrame batch aggregation
+
+Next integration stage (not currently end-to-end):
+Normalized lifecycle events -> Kafka topic -> consumer / Spark Structured Streaming
+    -> partitioned Parquet / analytical tables -> trend and pipeline dashboards
 ```
 
-Public-board ingestion also keeps its SQLite snapshot and lifecycle store, which feeds the Overview, Job explorer and Lifecycle pages. With `--kafka` its events flow into the streaming pipeline too. See [architecture.md](./architecture.md) and [runbook.md](./runbook.md).
+Implemented now: multi-account public-board adapters, validation, normalization, SQLite snapshot/lifecycle storage, idempotent unchanged-job handling, closure evidence, dashboard queries, a separate Kafka producer utility, a separate Parquet writer, and optional Spark batch aggregation.
+
+Not yet end-to-end: the public ingestion service does not publish its normalized lifecycle events to Kafka; no continuous Kafka consumer or Spark Structured Streaming query is wired into this ingestion flow; ingestion does not automatically maintain partitioned Parquet history. The Big Data page labels these boundaries accurately. These are the next engineering milestones, not capabilities to claim as complete.
 
 ## Run commands
 
@@ -68,4 +70,4 @@ python -m src.ingestion.service --config .\config\ingestion.local.json --spark-b
 python -m streamlit run .\src\dashboard\app.py
 ```
 
-Spark batch needs compatible Java/PySpark installed and configured. The normal ingestion command does not start Spark. For the streaming pipeline commands see [runbook.md](./runbook.md).
+Spark batch needs compatible Java/PySpark installed and configured. The normal ingestion command does not start Spark.
